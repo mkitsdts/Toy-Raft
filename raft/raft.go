@@ -186,7 +186,6 @@ func (rn *RaftNode) HandleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// 返回心跳
 		var respInfo AppendEntriesResp
 		respInfo.Term = rn.Term
-		rn.mux.RLock()
 		respInfo.Success = true
 		respBody, _ := json.Marshal(respInfo)
 		w.Write(respBody)
@@ -211,23 +210,25 @@ func (rn *RaftNode) HandleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	rn.Term = reqInfo.Term
 	rn.state = FOLLOWER
 	rn.LeaderIP = reqInfo.LeaderIP
-	select {
-	case rn.stateChan <- struct{}{}:
-		fmt.Println("状态变化通知成功")
-	default:
-		fmt.Println("状态变化通知失败")
-	}
-	rn.mux.Unlock()
+	rn.VotedFor = ""
+	rn.VoteCount = 0
 
 	if reqInfo.LeaderCommit > rn.CommitIndex {
 		rn.CommitIndex = min(reqInfo.LeaderCommit, len(rn.Log)-1)
 	}
+	rn.mux.Unlock()
 	// 返回心跳
 	var respInfo AppendEntriesResp
 	respInfo.Term = rn.Term
 	respInfo.Success = true
 	respBody, _ := json.Marshal(respInfo)
 	w.Write(respBody)
+	select {
+	case rn.stateChan <- struct{}{}:
+		fmt.Println("状态变化通知成功")
+	default:
+		fmt.Println("状态变化通知失败")
+	}
 	fmt.Println("心跳成功，当前任期：", rn.Term, "请求任期：", reqInfo.Term)
 }
 
@@ -244,9 +245,7 @@ func (rn *RaftNode) Start() {
 				select {
 				case <-time.After(HEARTBEAT_TIMEOUT):
 					// 心跳超时，变为候选人
-					rn.mux.Lock()
 					rn.state = CANDIDATE
-					rn.mux.Unlock()
 					fmt.Println("心跳超时，变为候选人...")
 				case <-rn.stateChan:
 					// 状态已变化，继续下一次循环
