@@ -168,7 +168,7 @@ func (rn *RaftNode) StartElection() {
 	}
 }
 
-// 发送信号
+// 发送心跳
 func (rn *RaftNode) SendHeartbeat() {
 	for _, node := range rn.NodeIP {
 		go func(targetNode string) {
@@ -235,7 +235,7 @@ func (rn *RaftNode) SendHeartbeat() {
 	}
 }
 
-// 发送心跳
+// 发送日志
 func (rn *RaftNode) SendLogEntry(logs []LogEntry) {
 	for _, node := range rn.NodeIP {
 		go func(targetNode string) {

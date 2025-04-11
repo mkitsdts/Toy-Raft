@@ -232,6 +232,51 @@ func (rn *RaftNode) HandleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("心跳成功，当前任期：", rn.Term, "请求任期：", reqInfo.Term)
 }
 
+func (rn *RaftNode) HandleClientAppendEntries(w http.ResponseWriter, r *http.Request) {
+	rn.mux.RLock();
+	isLeader := rn.state == LEADER
+	leaderIP := rn.LeaderIP
+	rn.mux.RUnlock()
+
+	if !isLeader {
+		// 重定向请求
+        response := map[string]string{
+            "success": "false",
+            "error": "not leader",
+            "leader": leaderIP,
+        }
+        jsonResp, _ := json.Marshal(response)
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(http.StatusTemporaryRedirect)
+        w.Write(jsonResp)
+        return
+	}
+
+	// 解析数据
+	var reqInfo AppendEntriesReq
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&reqInfo); err != nil {
+		return
+	}
+	// 处理日志
+	rn.mux.Lock()
+	fmt.Println("处理客户端日志请求...")
+	// 更新日志
+	rn.Log = append(rn.Log, reqInfo.Entries...)
+	// 更新提交索引
+	if reqInfo.LeaderCommit > rn.CommitIndex {
+		rn.CommitIndex = min(reqInfo.LeaderCommit, len(rn.Log)-1)
+	}
+	// 返回日志
+	var respInfo AppendEntriesResp
+	respInfo.Term = rn.Term
+	respInfo.Success = true
+	respBody, _ := json.Marshal(respInfo)
+	w.Write(respBody)
+	rn.PersisLog()
+	rn.mux.Unlock()
+}
+
 func (rn *RaftNode) Start() {
 	go func() {
 		for {
