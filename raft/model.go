@@ -3,10 +3,6 @@ package raft
 import "time"
 
 const (
-	FOLLOWER  uint8 = 0
-	CANDIDATE uint8 = 1
-	LEADER    uint8 = 2
-
 	TERM_MIN = 0
 
 	CONNECT_MAX_TIME  = 5 * time.Second
@@ -14,14 +10,6 @@ const (
 	HEARTBEAT_PERIOD  = 500 * time.Millisecond
 
 	DEFAULTPORT = "11451"
-
-	LOG_PATH         = "log.json"
-	RAFT_CONFIG_PATH = "raft.json"
-)
-
-const (
-	MIN_DURATION = 2 * time.Second
-	MAX_DURATION = 3 * time.Second
 )
 
 type Command struct {

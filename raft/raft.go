@@ -4,277 +4,70 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"sync"
 	"time"
 )
 
-// 处理选举请求
-func (rn *RaftNode) HandleElection(w http.ResponseWriter, r *http.Request) {
-	// 解析数据
-	var reqInfo ElectionReq
-	decoder := json.NewDecoder(r.Body)
-	err := decoder.Decode(&reqInfo)
+const (
+	FOLLOWER  uint8 = 0
+	CANDIDATE uint8 = 1
+	LEADER    uint8 = 2
+)
+
+const (
+	LOG_PATH         = "log.json"
+	RAFT_CONFIG_PATH = "raft.json"
+)
+
+type RaftNode struct {
+	mux         sync.RWMutex
+	state       uint8
+	Term        int      // 当前任期
+	VoteCount   uint16   // 获得的选票数
+	VotedFor    string   // 投票给的节点 IP
+	CommitIndex int      // 已知的最大的已经被提交的日志条目的索引值
+	LastApplied int      // 最后被应用到状态机的日志条目索引值
+	LocalIP     string   `json:"local_ip"`
+	NodeIP      []string `json:"node_ip"`
+	LeaderIP    string   `json:"leader_ip"`
+	Log         []LogEntry
+	stateChan   chan struct{} // 添加状态变化通知通道
+}
+
+func InitRaftNode() *RaftNode {
+	// 读取配置文件
+	file, err := os.Open(RAFT_CONFIG_PATH)
 	if err != nil {
-		return
+		panic(err)
 	}
-	// 处理选举
-	fmt.Println("处理选举请求...")
-	if rn.VotedFor != reqInfo.CandidateIP && rn.VotedFor != "" {
-		// 拒绝投票
-		respInfo := ElectionResp{
-			Term:        rn.Term,
-			VoteGranted: false,
-		}
-		respBody, _ := json.Marshal(respInfo)
-		w.Write(respBody)
-		fmt.Println("投票节点不一样，拒绝投票，当前任期：", rn.Term, "请求任期：", reqInfo.Term)
-		return
-	} else if rn.VotedFor == reqInfo.CandidateIP {
-		respInfo := ElectionResp{
-			Term:        rn.Term,
-			VoteGranted: true,
-		}
-		respBody, _ := json.Marshal(respInfo)
-		w.Write(respBody)
-		fmt.Println("同意投票，当前任期：", rn.Term, "请求任期：", reqInfo.Term)
-		return
-	}
+	defer file.Close()
 
-	if reqInfo.Term < rn.Term {
-		// 拒绝投票
-		respInfo := ElectionResp{
-			Term:        rn.Term,
-			VoteGranted: false,
-		}
-		respBody, _ := json.Marshal(respInfo)
-		w.Write(respBody)
-		fmt.Println("任期不同，拒绝投票，当前任期：", rn.Term, "请求任期：", reqInfo.Term)
-		return
-	} else if reqInfo.Term > rn.Term {
-		// 更新自身状态
-		rn.Term = reqInfo.Term
-		rn.state = FOLLOWER
-		rn.LeaderIP = ""
-		rn.VotedFor = reqInfo.CandidateIP
-		rn.VoteCount = 0
-		// 返回投票
-		respInfo := ElectionResp{
-			Term:        rn.Term,
-			VoteGranted: true,
-		}
-		respBody, _ := json.Marshal(respInfo)
-		w.Write(respBody)
-		fmt.Println("投票成功，当前任期：", rn.Term, "请求任期：", reqInfo.Term)
-		return
-	} else {
-		if rn.state == CANDIDATE {
-			if len(rn.Log)-1 > reqInfo.LastLogIndex {
-				// 拒绝投票
-				respInfo := ElectionResp{
-					Term:        rn.Term,
-					VoteGranted: false,
-				}
-				respBody, _ := json.Marshal(respInfo)
-				w.Write(respBody)
-				fmt.Println("日志不够新，拒绝投票，当前任期：", rn.Term, "请求任期：", reqInfo.Term)
-				return
-			} else {
-				// 投票
-				respInfo := ElectionResp{
-					Term:        rn.Term,
-					VoteGranted: true,
-				}
-				rn.Term = reqInfo.Term
-				rn.state = FOLLOWER
-				rn.VotedFor = reqInfo.CandidateIP
-				respBody, _ := json.Marshal(respInfo)
-				w.Write(respBody)
-				rn.LeaderIP = reqInfo.CandidateIP
-				fmt.Println("投票成功，当前任期：", rn.Term, "请求任期：", reqInfo.Term)
-				return
-			}
-		}
-	}
-}
+	decoder := json.NewDecoder(file)
 
-// 处理日志
-func (rn *RaftNode) HandleAppendEntries(w http.ResponseWriter, r *http.Request) {
-	// 解析数据
-	var reqInfo AppendEntriesReq
-	decoder := json.NewDecoder(r.Body)
-	if err := decoder.Decode(&reqInfo); err != nil {
-		return
+	type Config struct {
+		LocalIP string   `json:"local_ip"`
+		NodeIP  []string `json:"node_ip"`
 	}
-
-	rn.mux.Lock()
-	fmt.Println("处理日志请求...")
-	// 处理日志
-	if reqInfo.Term < rn.Term {
-		// 拒绝日志
-		var respInfo AppendEntriesResp
-		respInfo.Term = rn.Term
-		rn.mux.Unlock()
-		respInfo.Success = false
-		respBody, _ := json.Marshal(respInfo)
-		w.Write(respBody)
-		fmt.Println("拒绝日志，当前任期：", rn.Term, "请求任期：", reqInfo.Term)
-		return
+	config := Config{}
+	node := RaftNode{}
+	err = decoder.Decode(&config)
+	if err != nil {
+		panic(err)
 	}
-	// 检查日志一致性
-	if rn.Log[reqInfo.PrevLogIndex].Term != reqInfo.PrevLogTerm {
-		// 拒绝日志
-		var respInfo AppendEntriesResp
-		respInfo.Term = rn.Term
-		rn.mux.Unlock()
-		respInfo.Success = false
-		respBody, _ := json.Marshal(respInfo)
-		w.Write(respBody)
-		fmt.Println("本地日志：", rn.Log[reqInfo.PrevLogIndex].Term, "请求日志：", reqInfo.PrevLogTerm)
-		return
-	}
-	// 更新日志
-	rn.Log = append(rn.Log, reqInfo.Entries...)
-	// 更新提交索引
-	if reqInfo.LeaderCommit > rn.Log[len(rn.Log)-1].Term {
-		rn.Log[len(rn.Log)-1].Term = reqInfo.LeaderCommit
-	}
-	// 返回日志
-	var respInfo AppendEntriesResp
-	respInfo.Term = rn.Term
-	rn.mux.Unlock()
-	respInfo.Success = true
-	respBody, _ := json.Marshal(respInfo)
-	w.Write(respBody)
-	rn.PersisLog()
-}
-
-func (rn *RaftNode) HandleHeartbeat(w http.ResponseWriter, r *http.Request) {
-	// 解析数据
-	var reqInfo AppendEntriesReq
-	decoder := json.NewDecoder(r.Body)
-	if err := decoder.Decode(&reqInfo); err != nil {
-		return
-	}
-	rn.mux.RLock()
-	fmt.Println("处理心跳请求...")
-	// 检查任期
-	if reqInfo.Term < rn.Term {
-		// 拒绝心跳
-		fmt.Println("拒绝心跳，当前任期：", rn.Term, "请求任期：", reqInfo.Term)
-		var respInfo AppendEntriesResp
-		respInfo.Term = rn.Term
-		rn.mux.RUnlock()
-		respInfo.Success = false
-		respBody, _ := json.Marshal(respInfo)
-		w.Write(respBody)
-		return
-	} else if reqInfo.Term > rn.Term {
-		// 更新自身状态
-		rn.mux.RUnlock()
-		rn.mux.Lock()
-		rn.Term = reqInfo.Term
-		rn.state = FOLLOWER
-		select {
-		case rn.stateChan <- struct{}{}:
-			fmt.Println("状态变化通知成功")
-		default:
-			fmt.Println("状态变化通知失败")
-		}
-		rn.LeaderIP = reqInfo.LeaderIP
-		rn.VotedFor = ""
-		rn.VoteCount = 0
-		rn.mux.Unlock()
-		// 返回心跳
-		var respInfo AppendEntriesResp
-		respInfo.Term = rn.Term
-		respInfo.Success = true
-		respBody, _ := json.Marshal(respInfo)
-		w.Write(respBody)
-		fmt.Println("心跳成功，当前任期：", rn.Term, "请求任期：", reqInfo.Term)
-		return
-	}
-	// 检查日志一致性
-	if reqInfo.PrevLogIndex < len(rn.Log) {
-		// 本地数据比leader节点更新 拒绝心跳
-		fmt.Println("本地数据比 leader 节点新， 拒绝心跳")
-		var respInfo AppendEntriesResp
-		respInfo.Term = rn.Term
-		rn.mux.RUnlock()
-		respInfo.Success = false
-		respBody, _ := json.Marshal(respInfo)
-		w.Write(respBody)
-		return
-	}
-	rn.mux.RUnlock()
-	rn.mux.Lock()
-	// 更新自身状态
-	rn.Term = reqInfo.Term
-	rn.state = FOLLOWER
-	rn.LeaderIP = reqInfo.LeaderIP
-	rn.VotedFor = ""
-	rn.VoteCount = 0
-
-	if reqInfo.LeaderCommit > rn.CommitIndex {
-		rn.CommitIndex = min(reqInfo.LeaderCommit, len(rn.Log)-1)
-	}
-	rn.mux.Unlock()
-	// 返回心跳
-	var respInfo AppendEntriesResp
-	respInfo.Term = rn.Term
-	respInfo.Success = true
-	respBody, _ := json.Marshal(respInfo)
-	w.Write(respBody)
-	select {
-	case rn.stateChan <- struct{}{}:
-		fmt.Println("状态变化通知成功")
-	default:
-		fmt.Println("状态变化通知失败")
-	}
-	fmt.Println("心跳成功，当前任期：", rn.Term, "请求任期：", reqInfo.Term)
-}
-
-func (rn *RaftNode) HandleClientAppendEntries(w http.ResponseWriter, r *http.Request) {
-	rn.mux.RLock();
-	isLeader := rn.state == LEADER
-	leaderIP := rn.LeaderIP
-	rn.mux.RUnlock()
-
-	if !isLeader {
-		// 重定向请求
-        response := map[string]string{
-            "success": "false",
-            "error": "not leader",
-            "leader": leaderIP,
-        }
-        jsonResp, _ := json.Marshal(response)
-        w.Header().Set("Content-Type", "application/json")
-        w.WriteHeader(http.StatusTemporaryRedirect)
-        w.Write(jsonResp)
-        return
-	}
-
-	// 解析数据
-	var reqInfo AppendEntriesReq
-	decoder := json.NewDecoder(r.Body)
-	if err := decoder.Decode(&reqInfo); err != nil {
-		return
-	}
-	// 处理日志
-	rn.mux.Lock()
-	fmt.Println("处理客户端日志请求...")
-	// 更新日志
-	rn.Log = append(rn.Log, reqInfo.Entries...)
-	// 更新提交索引
-	if reqInfo.LeaderCommit > rn.CommitIndex {
-		rn.CommitIndex = min(reqInfo.LeaderCommit, len(rn.Log)-1)
-	}
-	// 返回日志
-	var respInfo AppendEntriesResp
-	respInfo.Term = rn.Term
-	respInfo.Success = true
-	respBody, _ := json.Marshal(respInfo)
-	w.Write(respBody)
-	rn.PersisLog()
-	rn.mux.Unlock()
+	node.state = FOLLOWER
+	node.Term = TERM_MIN
+	node.VoteCount = 0
+	node.LeaderIP = ""
+	node.VotedFor = ""
+	node.LocalIP = config.LocalIP
+	node.NodeIP = config.NodeIP
+	node.CommitIndex = 0
+	node.LastApplied = 0
+	node.mux = sync.RWMutex{}
+	node.stateChan = make(chan struct{}, 1)
+	node.Log = make([]LogEntry, 0)
+	return &node
 }
 
 func (rn *RaftNode) Start() {
@@ -332,4 +125,10 @@ func (rn *RaftNode) Start() {
 			}
 		}
 	}()
+	http.HandleFunc("/logentry", rn.HandleAppendEntries)
+	http.HandleFunc("/election", rn.HandleElection)
+	http.HandleFunc("/heartbeat", rn.HandleHeartbeat)
+	fmt.Println("Raft 节点启动完成")
+	// 启动 HTTP 服务器
+	http.ListenAndServe(fmt.Sprintf(":%s", DEFAULTPORT), nil)
 }
