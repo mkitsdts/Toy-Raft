@@ -33,6 +33,51 @@ func (e *NotLeaderError) Error() string {
 // command must produce the same result.
 type ApplyFunc func(Command) error
 
+// RollbackFunc compensates a command whose effect must be undone:
+//   - ApplyFunc returned an error, so the state machine may hold a partial
+//     write that the callback has to revert, or
+//   - an already applied log entry was discarded because it conflicted with the
+//     leader's log.
+//
+// Entries that were never applied are never passed to it, so it does not need
+// to guess whether the command took effect; it must, however, be idempotent.
+type RollbackFunc func(Command) error
+
+// Config bundles everything required to build a running Raft node.
+type Config struct {
+	// LocalIP is this node's address, with or without a port.
+	LocalIP string
+	// Peers are the other cluster members' addresses. An empty list makes this
+	// node a single-node leader immediately.
+	Peers []string
+	// Storage persists the replicated log. It may be nil for an in-memory node.
+	Storage LogStorage
+	// Apply is the state machine; Rollback compensates a failed or discarded
+	// apply. Both may be nil.
+	Apply    ApplyFunc
+	Rollback RollbackFunc
+}
+
+// New builds a Raft node from cfg. It restores any persisted log and registers
+// the state-machine callbacks. Once built, the caller only has to expose the
+// RPC routes (RegisterRoutes) and start the background loops (Run); the Raft
+// library takes care of replication, commitment, applying and rollback.
+func New(cfg Config) (*RaftNode, error) {
+	n := InitRaftNode(cfg.LocalIP, cfg.Peers)
+	if cfg.Apply != nil {
+		n.SetApplyFunc(cfg.Apply)
+	}
+	if cfg.Rollback != nil {
+		n.SetRollbackFunc(cfg.Rollback)
+	}
+	if cfg.Storage != nil {
+		if err := n.SetStorage(cfg.Storage); err != nil {
+			return nil, err
+		}
+	}
+	return n, nil
+}
+
 // RaftNode is a small Raft node used by the configuration center. All mutable
 // application data is represented by Command values and is applied only after
 // a majority has acknowledged its log entry.
@@ -62,6 +107,7 @@ type RaftNode struct {
 	stopCh    chan struct{}
 	stopOnce  sync.Once
 	apply     ApplyFunc
+	rollback  RollbackFunc
 	storage   LogStorage
 }
 
@@ -144,6 +190,21 @@ func (rn *RaftNode) lastLogIndexTermLocked() (int, int) {
 }
 
 func (rn *RaftNode) SetApplyFunc(fn ApplyFunc) { rn.mux.Lock(); rn.apply = fn; rn.mux.Unlock() }
+
+// SetRollbackFunc registers the compensation function invoked when a command
+// cannot be applied cleanly or when an applied log entry is discarded.
+func (rn *RaftNode) SetRollbackFunc(fn RollbackFunc) {
+	rn.mux.Lock()
+	rn.rollback = fn
+	rn.mux.Unlock()
+}
+
+// rollbackFunc snapshots the registered callback under the read lock.
+func (rn *RaftNode) rollbackFunc() RollbackFunc {
+	rn.mux.RLock()
+	defer rn.mux.RUnlock()
+	return rn.rollback
+}
 
 // SetStorage attaches the persistence backend and restores the persisted log
 // into memory. It must be called before Run so the election/heartbeat loop
@@ -440,7 +501,33 @@ func (rn *RaftNode) drainApply() {
 		}
 		if err := apply(entry.Comm); err != nil {
 			fmt.Printf("raft: apply log[%d] failed: %v\n", index, err)
+			rn.rollbackOne(entry.Comm)
 		}
+	}
+}
+
+// rollbackOne runs the RollbackFunc for a single command. Callers must hold
+// applyMux, which also serializes rollback against in-flight applies.
+func (rn *RaftNode) rollbackOne(cmd Command) {
+	rollback := rn.rollbackFunc()
+	if rollback == nil {
+		return
+	}
+	if err := rollback(cmd); err != nil {
+		fmt.Printf("raft: rollback command %q failed: %v\n", cmd.OpType, err)
+	}
+}
+
+// rollbackEntries undoes a suffix of already applied log entries, newest first,
+// so the state machine ends up consistent with the truncated log.
+func (rn *RaftNode) rollbackEntries(entries []LogEntry) {
+	if len(entries) == 0 {
+		return
+	}
+	rn.applyMux.Lock()
+	defer rn.applyMux.Unlock()
+	for i := len(entries) - 1; i >= 0; i-- {
+		rn.rollbackOne(entries[i].Comm)
 	}
 }
 

@@ -35,25 +35,18 @@ func (p *principal) canRead(namespace string) bool {
 type Server struct {
 	store *Store
 	token string
-	nodes NodeRegistrar
 	raft  RaftApplier
 }
 
 // RaftApplier is the subset of *raft.RaftNode used by the HTTP layer to route
-// configuration writes through the replicated log. It may be left unset in
-// tests, in which case writes go straight to the local store.
+// configuration writes through the replicated log and to redirect clients to
+// the current leader. It may be left unset in tests, in which case writes go
+// straight to the local store.
 type RaftApplier interface {
 	Apply(cmd raft.Command) (int, error)
 	IsLeader() bool
 	Leader() string
 	ProbePeer(addr string) bool
-}
-
-// NodeRegistrar receives the full peer address list whenever the set of
-// registered Raft nodes changes. *raft.RaftNode implements it, which lets the
-// running cluster pick up newly registered nodes without a restart.
-type NodeRegistrar interface {
-	SetNodes(addrs []string)
 }
 
 type nodeRequest struct {
@@ -81,10 +74,6 @@ type namespaceRequest struct {
 func NewServer(store *Store, token string) *Server {
 	return &Server{store: store, token: token}
 }
-
-// SetNodeRegistrar wires the running Raft node so node registrations take
-// effect immediately. It may be left unset in tests.
-func (s *Server) SetNodeRegistrar(r NodeRegistrar) { s.nodes = r }
 
 // SetRaft wires the running Raft node so configuration writes are replicated.
 func (s *Server) SetRaft(r RaftApplier) { s.raft = r }
@@ -660,7 +649,6 @@ func (s *Server) handleRegisterNode(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusInternalServerError, "failed to load registered node")
 				return
 			}
-			s.syncNodes()
 			writeJSON(w, http.StatusOK, node)
 			return
 		}
@@ -671,7 +659,6 @@ func (s *Server) handleRegisterNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to register node")
 		return
 	}
-	s.syncNodes()
 	writeJSON(w, http.StatusOK, node)
 }
 
@@ -696,7 +683,6 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
 		}
 		if handled, committed := s.replicate(w, r, cmd); handled {
 			if committed {
-				s.syncNodes()
 				w.WriteHeader(http.StatusNoContent)
 			}
 			return
@@ -709,24 +695,7 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to delete node")
 		return
 	}
-	s.syncNodes()
 	w.WriteHeader(http.StatusNoContent)
-}
-
-// syncNodes pushes the current node list to the running Raft node.
-func (s *Server) syncNodes() {
-	if s.nodes == nil {
-		return
-	}
-	nodes, err := s.store.ListNodes()
-	if err != nil {
-		return
-	}
-	addrs := make([]string, 0, len(nodes))
-	for _, n := range nodes {
-		addrs = append(addrs, net.JoinHostPort(n.IP, n.Port))
-	}
-	s.nodes.SetNodes(addrs)
 }
 
 func validatePort(port string) error {

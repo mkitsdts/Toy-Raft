@@ -57,13 +57,33 @@ Leader 校验（如 JSON/YAML 格式），非法请求在进入日志前就被�
 - append_logentry  调用节点的 `HandleAppendEntries` 方法
 - elect            调用节点的 `HandleElection` 方法
 - 客户端写请求     由 `configcenter.Server` 调用 `RaftNode.Apply`，由 Raft 负责
-  复制、提交，并通过 `SetApplyFunc` 注册的状态机函数落库
+  复制、提交，并通过注册的 `ApplyFunc` 状态机函数落库
 
 ## 关键接口
 
-- `LogStorage`：日志持久化后端（本项目用 SQLite 实现，见 `configcenter/logstore.go`）
-- `ApplyFunc`：状态机，日志提交后按序执行（见 `configcenter/state.go`）
-- `RaftNode.Apply(cmd)`：客户端写入口，Leader 上同步完成“复制→提交→应用”
+Raft 以库的形式被配置中心引用，边界很清晰：
+
+- 配置中心只做两件事——初始化节点、注册回调：
+
+  ```go
+  node, err := configcenter.NewRaftNode(store, localIP, peers)
+  ```
+
+  它内部向 Raft 注册的就是状态机回调 `ApplyFunc` 及其补偿 `RollbackFunc`，
+  其余（日志持久化与恢复、选举、心跳、复制、提交、按序 apply/rollback）
+  全部由 Raft 库完成。
+
+- `ApplyFunc`：状态机，日志提交后按序执行（见 `configcenter/state.go`）。
+- `RollbackFunc`：补偿回调，在 `ApplyFunc` 返回错误、或已 apply 的日志条目
+  因与 Leader 冲突被截断时调用，用于撤销状态机的部分/过期写入；从未 apply
+  的条目不会传入，回调需保证幂等。
+- `LogStorage`：日志持久化后端（本项目用 SQLite 实现，见
+  `configcenter/logstore.go`），由配置中心注入；`TruncateLogEntries` 负责
+  删除被冲突截断的已持久化条目。
+- `RaftNode.Apply(cmd)`：客户端写入口，Leader 上同步完成“复制→提交→应用”。
+- 节点成员变化（`node.register` / `node.delete`）在 apply 回调里顺带刷新
+  本节点 peer 列表，因此每个应用了该命令的节点都会跟踪最新成员，无需业务
+  层额外接线。
 
 ## 测试
 

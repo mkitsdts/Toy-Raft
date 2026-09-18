@@ -194,25 +194,16 @@ func TestInvalidTokenRejected(t *testing.T) {
 	}
 }
 
-type fakeRegistrar struct{ addrs []string }
-
-func (f *fakeRegistrar) SetNodes(addrs []string) { f.addrs = append([]string{}, addrs...) }
-
 func TestNodeRegistration(t *testing.T) {
 	server, ts := newTestServer(t)
-	reg := &fakeRegistrar{}
-	server.SetNodeRegistrar(reg)
 
-	// Register a node: the address must be pushed to the running Raft node.
+	// Register a node through the API.
 	status, _, body := do(t, ts, http.MethodPost, "/api/v1/nodes", adminToken, `{"ip":"10.0.0.2","port":"11451"}`)
 	if status != http.StatusOK {
 		t.Fatalf("register status = %d, want 200", status)
 	}
 	if body["ip"] != "10.0.0.2" || body["port"] != "11451" {
 		t.Fatalf("unexpected node body: %v", body)
-	}
-	if len(reg.addrs) != 1 || reg.addrs[0] != "10.0.0.2:11451" {
-		t.Fatalf("registrar got %v, want [10.0.0.2:11451]", reg.addrs)
 	}
 
 	// Registering the same address twice must not duplicate it.
@@ -241,12 +232,9 @@ func TestNodeRegistration(t *testing.T) {
 		t.Fatalf("role list status = %d, want 403", status)
 	}
 
-	// Delete removes the node and refreshes the peer list.
+	// Delete removes the node again.
 	id := body["id"].(float64)
 	if status, _, _ := do(t, ts, http.MethodDelete, fmt.Sprintf("/api/v1/nodes/%.0f", id), adminToken, ""); status != http.StatusNoContent {
 		t.Fatalf("delete status = %d, want 204", status)
-	}
-	if len(reg.addrs) != 0 {
-		t.Fatalf("registrar got %v after delete, want empty", reg.addrs)
 	}
 }

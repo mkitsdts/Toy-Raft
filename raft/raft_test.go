@@ -171,3 +171,81 @@ func TestApplyWithoutQuorumDoesNotCommit(t *testing.T) {
 		t.Fatalf("commit index advanced without quorum: %d", n.CommitIndex)
 	}
 }
+
+func TestNewConfiguresCallbacks(t *testing.T) {
+	applied := 0
+	rolled := 0
+	n, err := New(Config{
+		LocalIP:  "127.0.0.1",
+		Apply:    func(Command) error { applied++; return errors.New("boom") },
+		Rollback: func(Command) error { rolled++; return nil },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	n.appendEntries(AppendEntriesReq{
+		Term: 1, LeaderIP: "x", PrevLogIndex: -1,
+		Entries: []LogEntry{{Term: 1, Comm: cmd("a")}}, LeaderCommit: 0,
+	})
+	if applied != 1 {
+		t.Fatalf("apply called %d times, want 1", applied)
+	}
+	if rolled != 1 {
+		t.Fatalf("rollback called %d times, want 1", rolled)
+	}
+}
+
+func TestFailedApplyInvokesRollback(t *testing.T) {
+	n := newFollower(1, nil, -1)
+	var applied, rolled []string
+	n.SetApplyFunc(func(c Command) error {
+		if c.OpType == "bad" {
+			return errors.New("boom")
+		}
+		applied = append(applied, c.OpType)
+		return nil
+	})
+	n.SetRollbackFunc(func(c Command) error {
+		rolled = append(rolled, c.OpType)
+		return nil
+	})
+
+	resp := n.appendEntries(AppendEntriesReq{
+		Term: 1, LeaderIP: "x", PrevLogIndex: -1,
+		Entries:      []LogEntry{{Term: 1, Comm: cmd("ok")}, {Term: 1, Comm: cmd("bad")}},
+		LeaderCommit: 1,
+	})
+	if !resp.Success {
+		t.Fatalf("expected success, got %+v", resp)
+	}
+	if len(applied) != 1 || applied[0] != "ok" {
+		t.Fatalf("applied = %v, want [ok]", applied)
+	}
+	if len(rolled) != 1 || rolled[0] != "bad" {
+		t.Fatalf("rolled = %v, want [bad]", rolled)
+	}
+}
+
+func TestTruncatingAppliedEntryInvokesRollback(t *testing.T) {
+	n := newFollower(1, []LogEntry{{Term: 1, Comm: cmd("a")}, {Term: 1, Comm: cmd("b")}}, 1)
+	var rolled []string
+	n.SetApplyFunc(func(Command) error { return nil })
+	n.SetRollbackFunc(func(c Command) error {
+		rolled = append(rolled, c.OpType)
+		return nil
+	})
+
+	resp := n.appendEntries(AppendEntriesReq{
+		Term: 1, LeaderIP: "x", PrevLogIndex: 0, PrevLogTerm: 1,
+		Entries: []LogEntry{{Term: 2, Comm: cmd("c")}},
+	})
+	if !resp.Success {
+		t.Fatalf("expected success, got %+v", resp)
+	}
+	if len(rolled) != 1 || rolled[0] != "b" {
+		t.Fatalf("rolled = %v, want [b]", rolled)
+	}
+	if n.LastApplied != 0 {
+		t.Fatalf("last applied = %d, want 0 after truncating an applied entry", n.LastApplied)
+	}
+}

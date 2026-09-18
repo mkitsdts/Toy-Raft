@@ -20,14 +20,13 @@ func newRaftServer(t *testing.T) (*Server, *Store, *httptest.Server, *raft.RaftN
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	node := raft.InitRaftNode("127.0.0.1", nil)
+	node, err := NewRaftNode(store, "127.0.0.1", nil)
+	if err != nil {
+		t.Fatalf("new raft node: %v", err)
+	}
 	if !node.IsLeader() {
 		t.Fatal("single-node cluster should elect itself leader")
 	}
-	if err := node.SetStorage(store); err != nil {
-		t.Fatalf("set storage: %v", err)
-	}
-	node.SetApplyFunc(store.ApplyCommand)
 
 	server := NewServer(store, adminToken)
 	server.SetRaft(node)
@@ -326,5 +325,39 @@ func TestNodeRegistrationThroughRaft(t *testing.T) {
 	}
 	if _, err := store.NodeByID(id); err != ErrNotFound {
 		t.Fatalf("node still present: err = %v", err)
+	}
+}
+
+// TestMembershipCommandRefreshesPeers checks that applying a membership command
+// updates the Raft node's peer list, which is what lets every node track the
+// cluster without the HTTP server doing any extra wiring.
+func TestMembershipCommandRefreshesPeers(t *testing.T) {
+	store, err := OpenStore(DatabaseConfig{Driver: "sqlite3", DSN: filepath.Join(t.TempDir(), "test.db")})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	node := raft.InitRaftNode("127.0.0.1", nil)
+
+	if _, err := store.RegisterNode("10.0.0.2", "11451"); err != nil {
+		t.Fatalf("register node: %v", err)
+	}
+	cmd, err := newCommand(OpNodeRegister, nodeRegisterPayload{IP: "10.0.0.2", Port: "11451"})
+	if err != nil {
+		t.Fatalf("build command: %v", err)
+	}
+	if err := syncRaftPeers(store, node, cmd); err != nil {
+		t.Fatalf("sync peers: %v", err)
+	}
+	peers := node.Nodes()
+	if len(peers) != 1 || peers[0] != "10.0.0.2:11451" {
+		t.Fatalf("peers = %v, want [10.0.0.2:11451]", peers)
+	}
+
+	// A non-membership command must not touch the peer list.
+	if err := syncRaftPeers(store, node, raft.Command{OpType: OpConfigPut}); err != nil {
+		t.Fatalf("sync peers (non-membership): %v", err)
+	}
+	if got := node.Nodes(); len(got) != 1 {
+		t.Fatalf("peers changed on non-membership command: %v", got)
 	}
 }

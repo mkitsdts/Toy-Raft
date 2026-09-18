@@ -62,3 +62,9 @@ func (s *Store) LoadLogEntries() ([]raft.LogEntry, error) {
 	}
 	return entries, nil
 }
+
+// TruncateLogEntries implements raft.LogStorage by deleting every persisted
+// entry at or after fromIndex.
+func (s *Store) TruncateLogEntries(fromIndex int) error {
+	return s.db.Where("log_index >= ?", fromIndex).Delete(&RaftLogEntry{}).Error
+}
