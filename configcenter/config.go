@@ -41,12 +41,11 @@ type RuntimeConfig struct {
 
 // LoadOrInitializeRuntimeConfig loads settings from the database. On the first
 // run it persists node settings. The admin token comes from RAFT_AUTH_TOKEN
-// when set; otherwise a short random token is generated on every start so the
-// value is never fixed.
+// when set; otherwise it is read from the database, and only generated (and
+// persisted) the very first time so it stays stable across restarts.
 func (s *Store) LoadOrInitializeRuntimeConfig() (RuntimeConfig, error) {
 	var setting SystemSetting
-	err := s.db.First(&setting, 1).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
+	if err := s.db.First(&setting, 1).Error; errors.Is(err, gorm.ErrRecordNotFound) {
 		localIP := strings.TrimSpace(os.Getenv("RAFT_LOCAL_IP"))
 		if localIP == "" {
 			localIP = "127.0.0.1"
@@ -69,10 +68,14 @@ func (s *Store) LoadOrInitializeRuntimeConfig() (RuntimeConfig, error) {
 		return RuntimeConfig{}, fmt.Errorf("decode node IPs from database: %w", err)
 	}
 
-	// 管理员 token：优先使用环境变量；否则每次启动随机生成一个短 token
-	// （uuid 前面一段），不落库为固定值，保证既短又不固定。
+	// 管理员 token：优先使用环境变量；否则复用数据库中已保存的 token；
+	// 只有首次运行时才随机生成一个短 token（uuid 前面一段）并落库，
+	// 这样重启后 token 保持不变。
 	generatedToken := false
 	token := strings.TrimSpace(os.Getenv("RAFT_AUTH_TOKEN"))
+	if token == "" {
+		token = strings.TrimSpace(setting.AuthToken)
+	}
 	if token == "" {
 		var tokenErr error
 		token, tokenErr = newAdminToken()
@@ -80,6 +83,9 @@ func (s *Store) LoadOrInitializeRuntimeConfig() (RuntimeConfig, error) {
 			return RuntimeConfig{}, fmt.Errorf("generate admin token: %w", tokenErr)
 		}
 		generatedToken = true
+		if err := s.db.Model(&setting).Update("auth_token", token).Error; err != nil {
+			return RuntimeConfig{}, fmt.Errorf("persist admin token: %w", err)
+		}
 	}
 	return RuntimeConfig{
 		LocalIP:        setting.LocalIP,

@@ -33,7 +33,7 @@ func main() {
 		fmt.Println("请在请求头中使用: Auth: " + cfg.AuthToken)
 		fmt.Println("======================================================")
 	} else {
-		fmt.Println("管理员 token（拥有全部权限，供前端调用）: " + cfg.AuthToken)
+		fmt.Println("admin token: " + cfg.AuthToken)
 	}
 
 	fmt.Println("初始化 Raft 节点...")
