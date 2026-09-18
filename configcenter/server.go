@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -32,6 +33,19 @@ func (p *principal) canRead(namespace string) bool {
 type Server struct {
 	store *Store
 	token string
+	nodes NodeRegistrar
+}
+
+// NodeRegistrar receives the full peer address list whenever the set of
+// registered Raft nodes changes. *raft.RaftNode implements it, which lets the
+// running cluster pick up newly registered nodes without a restart.
+type NodeRegistrar interface {
+	SetNodes(addrs []string)
+}
+
+type nodeRequest struct {
+	IP   string `json:"ip"`
+	Port string `json:"port"`
 }
 
 type registerRequest struct {
@@ -51,6 +65,10 @@ func NewServer(store *Store, token string) *Server {
 	return &Server{store: store, token: token}
 }
 
+// SetNodeRegistrar wires the running Raft node so node registrations take
+// effect immediately. It may be left unset in tests.
+func (s *Server) SetNodeRegistrar(r NodeRegistrar) { s.nodes = r }
+
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	// API
 	mux.Handle("GET /api/v1/whoami", s.auth(http.HandlerFunc(s.handleWhoami)))
@@ -64,6 +82,9 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("PUT /api/v1/roles/{id}", s.auth(s.requireAdmin(http.HandlerFunc(s.handleUpdateRole))))
 	mux.Handle("DELETE /api/v1/roles/{id}", s.auth(s.requireAdmin(http.HandlerFunc(s.handleDeleteRole))))
 	mux.Handle("POST /api/v1/roles/{id}/rotate", s.auth(s.requireAdmin(http.HandlerFunc(s.handleRotateRole))))
+	mux.Handle("GET /api/v1/nodes", s.auth(s.requireAdmin(http.HandlerFunc(s.handleListNodes))))
+	mux.Handle("POST /api/v1/nodes", s.auth(s.requireAdmin(http.HandlerFunc(s.handleRegisterNode))))
+	mux.Handle("DELETE /api/v1/nodes/{id}", s.auth(s.requireAdmin(http.HandlerFunc(s.handleDeleteNode))))
 
 	// Frontend (embedded single-page app)
 	assets, err := fs.Sub(webFS, "web")
@@ -287,6 +308,89 @@ func (s *Server) handleRotateRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, role)
+}
+
+// ---- raft nodes (admin only) ------------------------------------------------
+
+// GET /api/v1/nodes lists the registered Raft cluster members.
+func (s *Server) handleListNodes(w http.ResponseWriter, r *http.Request) {
+	nodes, err := s.store.ListNodes()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list nodes")
+		return
+	}
+	writeJSON(w, http.StatusOK, nodes)
+}
+
+// POST /api/v1/nodes dynamically registers a Raft node (ip + port). The running
+// Raft node receives the updated peer list through the registrar.
+func (s *Server) handleRegisterNode(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+	defer r.Body.Close()
+	var req nodeRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	req.IP = strings.TrimSpace(req.IP)
+	req.Port = strings.TrimSpace(req.Port)
+	if req.IP == "" || req.Port == "" {
+		writeError(w, http.StatusBadRequest, "ip and port are required")
+		return
+	}
+	if err := validatePort(req.Port); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	node, err := s.store.RegisterNode(req.IP, req.Port)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to register node")
+		return
+	}
+	s.syncNodes()
+	writeJSON(w, http.StatusOK, node)
+}
+
+// DELETE /api/v1/nodes/{id} removes a registered node and refreshes the peer list.
+func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseUint(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid node id")
+		return
+	}
+	if err := s.store.DeleteNode(uint(id)); errors.Is(err, ErrNotFound) {
+		writeError(w, http.StatusNotFound, "node not found")
+		return
+	} else if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to delete node")
+		return
+	}
+	s.syncNodes()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// syncNodes pushes the current node list to the running Raft node.
+func (s *Server) syncNodes() {
+	if s.nodes == nil {
+		return
+	}
+	nodes, err := s.store.ListNodes()
+	if err != nil {
+		return
+	}
+	addrs := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		addrs = append(addrs, net.JoinHostPort(n.IP, n.Port))
+	}
+	s.nodes.SetNodes(addrs)
+}
+
+func validatePort(port string) error {
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return errors.New("port must be a number between 1 and 65535")
+	}
+	return nil
 }
 
 // ---- auth -------------------------------------------------------------------

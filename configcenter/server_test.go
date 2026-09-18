@@ -2,6 +2,7 @@ package configcenter
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -190,5 +191,62 @@ func TestInvalidTokenRejected(t *testing.T) {
 	}
 	if status, _, _ := do(t, ts, http.MethodGet, "/api/v1/configs", "", ""); status != http.StatusUnauthorized {
 		t.Fatalf("missing token: status = %d, want 401", status)
+	}
+}
+
+type fakeRegistrar struct{ addrs []string }
+
+func (f *fakeRegistrar) SetNodes(addrs []string) { f.addrs = append([]string{}, addrs...) }
+
+func TestNodeRegistration(t *testing.T) {
+	server, ts := newTestServer(t)
+	reg := &fakeRegistrar{}
+	server.SetNodeRegistrar(reg)
+
+	// Register a node: the address must be pushed to the running Raft node.
+	status, _, body := do(t, ts, http.MethodPost, "/api/v1/nodes", adminToken, `{"ip":"10.0.0.2","port":"11451"}`)
+	if status != http.StatusOK {
+		t.Fatalf("register status = %d, want 200", status)
+	}
+	if body["ip"] != "10.0.0.2" || body["port"] != "11451" {
+		t.Fatalf("unexpected node body: %v", body)
+	}
+	if len(reg.addrs) != 1 || reg.addrs[0] != "10.0.0.2:11451" {
+		t.Fatalf("registrar got %v, want [10.0.0.2:11451]", reg.addrs)
+	}
+
+	// Registering the same address twice must not duplicate it.
+	if status, _, _ := do(t, ts, http.MethodPost, "/api/v1/nodes", adminToken, `{"ip":"10.0.0.2","port":"11451"}`); status != http.StatusOK {
+		t.Fatalf("re-register status = %d, want 200", status)
+	}
+	status, raw, _ := do(t, ts, http.MethodGet, "/api/v1/nodes", adminToken, "")
+	if status != http.StatusOK || strings.Count(raw, `"ip"`) != 1 {
+		t.Fatalf("list status=%d body=%s", status, raw)
+	}
+
+	// Validation.
+	if status, _, _ := do(t, ts, http.MethodPost, "/api/v1/nodes", adminToken, `{"ip":"1.2.3.4","port":"99999"}`); status != http.StatusBadRequest {
+		t.Fatalf("invalid port status = %d, want 400", status)
+	}
+	if status, _, _ := do(t, ts, http.MethodPost, "/api/v1/nodes", adminToken, `{"ip":"","port":"11451"}`); status != http.StatusBadRequest {
+		t.Fatalf("missing ip status = %d, want 400", status)
+	}
+
+	// Role tokens may not manage nodes.
+	role, err := server.store.CreateRole("ops", "", nil)
+	if err != nil {
+		t.Fatalf("create role: %v", err)
+	}
+	if status, _, _ := do(t, ts, http.MethodGet, "/api/v1/nodes", role.Token, ""); status != http.StatusForbidden {
+		t.Fatalf("role list status = %d, want 403", status)
+	}
+
+	// Delete removes the node and refreshes the peer list.
+	id := body["id"].(float64)
+	if status, _, _ := do(t, ts, http.MethodDelete, fmt.Sprintf("/api/v1/nodes/%.0f", id), adminToken, ""); status != http.StatusNoContent {
+		t.Fatalf("delete status = %d, want 204", status)
+	}
+	if len(reg.addrs) != 0 {
+		t.Fatalf("registrar got %v after delete, want empty", reg.addrs)
 	}
 }

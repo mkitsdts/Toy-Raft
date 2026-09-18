@@ -9,7 +9,7 @@ import (
 
 // 发送心跳
 func (rn *RaftNode) SendHeartbeat() {
-	for _, node := range rn.NodeIP {
+	for _, node := range rn.peerList() {
 		go func(targetNode string) {
 			// 生成包
 			fmt.Println("正在向 IP: ", node, "发送心跳...")
@@ -35,7 +35,7 @@ func (rn *RaftNode) SendHeartbeat() {
 			}
 			reqBody, _ := json.Marshal(reqInfo)
 			// 发送心跳
-			req, err := http.NewRequest("POST", "http://"+node+":"+DEFAULTPORT+"/heartbeat", bytes.NewBuffer(reqBody))
+			req, err := http.NewRequest("POST", peerURL(node, "/heartbeat"), bytes.NewBuffer(reqBody))
 			if err != nil {
 				return
 			}

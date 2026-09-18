@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -42,17 +43,57 @@ type RaftNode struct {
 
 func InitRaftNode(localIP string, nodeIPs []string) *RaftNode {
 	n := &RaftNode{
-		state: FOLLOWER, Term: TERM_MIN, LocalIP: localIP, NodeIP: nodeIPs,
+		state: FOLLOWER, Term: TERM_MIN, LocalIP: strings.TrimSpace(localIP),
 		CommitIndex: -1, LastApplied: -1, stateChan: make(chan struct{}, 1),
 		stopCh: make(chan struct{}),
 		Log:    make([]LogEntry, 0),
 	}
-	// A one-node cluster has a majority immediately.
-	if len(nodeIPs) == 0 {
-		n.state = LEADER
-		n.LeaderIP = localIP
-	}
+	// SetNodes also promotes an empty cluster to a single-node leader, which is
+	// the majority immediately.
+	n.SetNodes(nodeIPs)
 	return n
+}
+
+// SetNodes replaces the peer list at runtime. Entries may be "host" or
+// "host:port"; the local node itself and duplicates are ignored. Registered
+// nodes added through the config center take effect without a restart.
+func (rn *RaftNode) SetNodes(addrs []string) {
+	self := PeerAddress(rn.LocalIP)
+	nodes := make([]string, 0, len(addrs))
+	seen := make(map[string]struct{}, len(addrs))
+	for _, addr := range addrs {
+		normalized := PeerAddress(addr)
+		if normalized == "" || normalized == self {
+			continue
+		}
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		nodes = append(nodes, normalized)
+	}
+
+	rn.mux.Lock()
+	rn.NodeIP = nodes
+	if len(nodes) == 0 && rn.state != LEADER {
+		rn.state = LEADER
+		rn.LeaderIP = rn.LocalIP
+	}
+	rn.mux.Unlock()
+	rn.notify()
+}
+
+// Nodes returns a snapshot of the current peer list.
+func (rn *RaftNode) Nodes() []string { return rn.peerList() }
+
+// peerList returns a copy of NodeIP under the read lock so callers can iterate
+// safely while the list is being updated.
+func (rn *RaftNode) peerList() []string {
+	rn.mux.RLock()
+	defer rn.mux.RUnlock()
+	out := make([]string, len(rn.NodeIP))
+	copy(out, rn.NodeIP)
+	return out
 }
 
 func (rn *RaftNode) SetApplyFunc(fn ApplyFunc) { rn.mux.Lock(); rn.apply = fn; rn.mux.Unlock() }
@@ -101,16 +142,18 @@ func (rn *RaftNode) notify() {
 }
 
 func (rn *RaftNode) Run() {
-	if len(rn.NodeIP) == 0 {
-		return
-	}
 	go func() {
 		for {
 			rn.mux.RLock()
 			state := rn.state
 			rn.mux.RUnlock()
 			if state == LEADER {
-				rn.SendHeartbeat()
+				// A single-node (or not-yet-configured) cluster has no peers to
+				// heartbeat; it still stays in the loop so nodes registered later
+				// are picked up.
+				if len(rn.peerList()) > 0 {
+					rn.SendHeartbeat()
+				}
 				select {
 				case <-rn.stopCh:
 					return

@@ -8,6 +8,7 @@ const state = {
   currentNamespace: null,
   configs: [],
   roles: [],
+  nodes: [],
   editingRoleId: null,
 };
 
@@ -272,6 +273,65 @@ async function saveRole() {
   } catch (e) { $("#role-error").textContent = e.message; }
 }
 
+/* ---------- 节点管理 ---------- */
+
+async function loadNodes() {
+  state.nodes = await api("/api/v1/nodes");
+  renderNodeTable();
+}
+
+function renderNodeTable() {
+  const tbody = $("#node-tbody");
+  tbody.innerHTML = "";
+  if (!state.nodes || state.nodes.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="5" class="muted" style="cursor:default;text-align:center">暂无节点，点击右上角注册</td></tr>`;
+    return;
+  }
+  for (const n of state.nodes) {
+    const tr = document.createElement("tr");
+    tr.style.cursor = "default";
+    tr.innerHTML = `
+      <td><span class="node-addr">${esc(n.ip)}:${esc(n.port)}</span></td>
+      <td>${esc(n.ip)}</td>
+      <td>${esc(n.port)}</td>
+      <td>${formatTime(n.created_at)}</td>
+      <td><div class="actions">
+        <button class="btn small danger" data-act="del">删除</button>
+      </div></td>`;
+    tr.onclick = async (e) => {
+      if (e.target.dataset?.act !== "del") return;
+      if (!confirm(`确定移除节点 ${n.ip}:${n.port} ?`)) return;
+      try {
+        await api(`/api/v1/nodes/${n.id}`, { method: "DELETE" });
+        toast("节点已移除");
+        await loadNodes();
+      } catch (err) { toast(err.message, true); }
+    };
+    tbody.appendChild(tr);
+  }
+}
+
+function openNodeModal() {
+  $("#node-ip").value = "";
+  $("#node-port").value = "11451";
+  $("#node-error").textContent = "";
+  $("#node-modal").classList.remove("hidden");
+  $("#node-ip").focus();
+}
+
+async function saveNode() {
+  const ip = $("#node-ip").value.trim();
+  const port = $("#node-port").value.trim();
+  $("#node-error").textContent = "";
+  if (!ip || !port) { $("#node-error").textContent = "IP 和端口不能为空"; return; }
+  try {
+    await api("/api/v1/nodes", { method: "POST", body: JSON.stringify({ ip, port }) });
+    $("#node-modal").classList.add("hidden");
+    toast("节点已注册");
+    await loadNodes();
+  } catch (e) { $("#node-error").textContent = e.message; }
+}
+
 /* ---------- 工具 ---------- */
 
 function switchTab(name) {
@@ -279,6 +339,7 @@ function switchTab(name) {
   $$(".tab-page").forEach((p) => p.classList.add("hidden"));
   $(`#tab-${name}`).classList.remove("hidden");
   if (name === "roles") loadRoles().catch((e) => toast(e.message, true));
+  if (name === "nodes") loadNodes().catch((e) => toast(e.message, true));
 }
 
 function esc(s) {
@@ -319,6 +380,10 @@ $("#cfg-save").onclick = saveConfig;
 $("#new-role-btn").onclick = () => openRoleModal(null);
 $("#role-cancel").onclick = () => $("#role-modal").classList.add("hidden");
 $("#role-save").onclick = saveRole;
+$("#new-node-btn").onclick = openNodeModal;
+$("#node-cancel").onclick = () => $("#node-modal").classList.add("hidden");
+$("#node-save").onclick = saveNode;
+$("#node-port").addEventListener("keydown", (e) => { if (e.key === "Enter") saveNode(); });
 $$(".modal-mask").forEach((m) =>
   m.addEventListener("click", (e) => { if (e.target === m) m.classList.add("hidden"); }));
 

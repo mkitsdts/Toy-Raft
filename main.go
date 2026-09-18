@@ -37,7 +37,20 @@ func main() {
 	}
 
 	fmt.Println("初始化 Raft 节点...")
-	node := raft.InitRaftNode(cfg.LocalIP, cfg.NodeIPs)
+	// 把环境变量里配置的节点写入注册表（已存在的不会重复插入），
+	// 之后节点列表以数据库为准，可在配置中心动态增删。
+	if err := store.SeedNodes(cfg.NodeIPs, raft.DEFAULTPORT); err != nil {
+		log.Fatalf("初始化 Raft 节点列表失败: %v", err)
+	}
+	nodes, err := store.ListNodes()
+	if err != nil {
+		log.Fatalf("加载 Raft 节点列表失败: %v", err)
+	}
+	addresses := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		addresses = append(addresses, net.JoinHostPort(n.IP, n.Port))
+	}
+	node := raft.InitRaftNode(cfg.LocalIP, addresses)
 	if err := node.SetStorage(store); err != nil {
 		log.Fatalf("加载 Raft 日志失败: %v", err)
 	}
@@ -45,7 +58,10 @@ func main() {
 
 	mux := http.NewServeMux()
 	node.RegisterRoutes(mux)
-	configcenter.NewServer(store, cfg.AuthToken).RegisterRoutes(mux)
+	configServer := configcenter.NewServer(store, cfg.AuthToken)
+	// 动态注册/删除节点后，立即刷新 Raft 的 peer 列表。
+	configServer.SetNodeRegistrar(node)
+	configServer.RegisterRoutes(mux)
 	node.Run()
 
 	address := ":" + raft.DEFAULTPORT

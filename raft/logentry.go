@@ -9,7 +9,7 @@ import (
 
 // 发送日志
 func (rn *RaftNode) SendLogEntry(logs []LogEntry) {
-	for _, node := range rn.NodeIP {
+	for _, node := range rn.peerList() {
 		go func(targetNode string) {
 			// 生成包
 			fmt.Println("正在向 IP: ", node, "发送日志...")
@@ -23,7 +23,7 @@ func (rn *RaftNode) SendLogEntry(logs []LogEntry) {
 			}
 			reqBody, _ := json.Marshal(reqInfo)
 			// 发送日志
-			req, err := http.NewRequest("POST", "http://"+node+":"+DEFAULTPORT+"/logentry", bytes.NewBuffer(reqBody))
+			req, err := http.NewRequest("POST", peerURL(node, "/logentry"), bytes.NewBuffer(reqBody))
 			if err != nil {
 				return
 			}

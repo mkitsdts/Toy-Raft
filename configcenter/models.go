@@ -1,6 +1,9 @@
 package configcenter
 
-import "time"
+import (
+	"net"
+	"time"
+)
 
 // Supported configuration value formats.
 const (
@@ -32,6 +35,21 @@ type SystemSetting struct {
 	AuthToken string `gorm:"size:512;not null"`
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+// NodeConfig is a dynamically registered Raft cluster member. IP and Port are
+// stored separately so the UI can edit them; together they are unique.
+type NodeConfig struct {
+	ID        uint      `json:"id" gorm:"primaryKey"`
+	IP        string    `json:"ip" gorm:"size:255;not null;uniqueIndex:idx_node_addr"`
+	Port      string    `json:"port" gorm:"size:16;not null;uniqueIndex:idx_node_addr"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// Address returns the node as a host:port string.
+func (n NodeConfig) Address() string {
+	return net.JoinHostPort(n.IP, n.Port)
 }
 
 // Namespace groups configurations and is the unit a role is granted access to.

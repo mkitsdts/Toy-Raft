@@ -8,38 +8,6 @@
 </head>
 <body>
 
-    curl --location 'http://dify.umcasual.com/v1/workflows/run' \
-    --header 'Authorization: Bearer app-EhTm9tmRnkZP5nW0Qdiv2QlL' \
-    --header 'Content-Type: application/json' \
-    --data '{
-        "inputs": {
-            "core_keyword": "wireless bluetooth earbuds",
-            "long_tail_keywords": "wireless earbuds noise cancelling long battery\nsports earbuds waterproof open ear\n2025 bluetooth earbuds best value",
-            "product_description": "ANC sports wireless earbuds, open-ear design, 12h single charge, 40h with charging case, IPX5 waterproof, Bluetooth 5.3, low-latency gaming mode. Target: 18-35 sports users.",
-            "page_type": "Category Page",
-            "page_type_rule": "指定的页面类型具有最高优先级，并应贯穿Top 10分析、Topic选择、模块类型判断、内容大纲设计和最终文案撰写的全过程。不要默认每个核心关键词对应的页面都是首页。",
-            "reference_img": {
-                "transfer_method": "local_file",
-                "type": "image",
-                "upload_file_id": "5bab4f22-e211-4788-bd63-0ae4732bab34"
-            },
-            "inject_imgs": [
-                {
-                    "transfer_method": "local_file",
-                    "type": "image",
-                    "upload_file_id": "5bab4f22-e211-4788-bd63-0ae4732bab34"
-                },
-                {
-                    "transfer_method": "local_file",
-                    "type": "image",
-                    "upload_file_id": "5bab4f22-e211-4788-bd63-0ae4732bab34"
-                }
-            ]
-        },
-        "response_mode": "streaming",
-        "user": "abc-123"
-    }'
-
 <!-- 登录页 -->
 <div id="login-view" class="login-wrap hidden">
   <div class="login-card">
@@ -58,6 +26,7 @@
     <nav id="tabs">
       <button class="tab active" data-tab="configs">配置管理</button>
       <button class="tab admin-only" data-tab="roles">角色管理</button>
+      <button class="tab admin-only" data-tab="nodes">节点管理</button>
     </nav>
     <div class="topbar-right">
       <span id="identity-badge" class="badge"></span>
@@ -107,6 +76,23 @@
       </table>
     </section>
   </main>
+
+  <!-- 节点管理 -->
+  <main id="tab-nodes" class="tab-page hidden">
+    <section class="content full">
+      <div class="content-head">
+        <h2>Raft 节点</h2>
+        <button id="new-node-btn" class="btn primary">+ 注册节点</button>
+      </div>
+      <p class="muted">填写节点的 IP 和端口后动态注册，集群会立即使用新的节点列表，无需重启。</p>
+      <table class="table">
+        <thead>
+          <tr><th>节点地址</th><th>IP</th><th>端口</th><th>注册时间</th><th>操作</th></tr>
+        </thead>
+        <tbody id="node-tbody"></tbody>
+      </table>
+    </section>
+  </main>
 </div>
 
 <!-- 配置编辑弹窗 -->
@@ -148,6 +134,22 @@
     <div class="modal-actions">
       <button id="role-cancel" class="btn">取消</button>
       <button id="role-save" class="btn primary">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 节点注册弹窗 -->
+<div id="node-modal" class="modal-mask hidden">
+  <div class="modal">
+    <h3>注册 Raft 节点</h3>
+    <label>节点 IP / 主机</label>
+    <input id="node-ip" placeholder="例如 192.168.1.10">
+    <label>端口</label>
+    <input id="node-port" placeholder="11451" value="11451">
+    <div id="node-error" class="error-text"></div>
+    <div class="modal-actions">
+      <button id="node-cancel" class="btn">取消</button>
+      <button id="node-save" class="btn primary">注册</button>
     </div>
   </div>
 </div>

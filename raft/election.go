@@ -24,7 +24,8 @@ func (rn *RaftNode) StartElection() {
 
 	fmt.Println("正在向其他节点发送选举请求...")
 
-	for _, node := range rn.NodeIP {
+	peers := rn.peerList()
+	for _, node := range peers {
 		// 发送选举请求
 		go func(targetNode string) {
 			// 生成选举请求
@@ -46,8 +47,8 @@ func (rn *RaftNode) StartElection() {
 				LastLogTerm:  prevLogTerm,
 			}
 			reqBody, _ := json.Marshal(reqInfo)
-			req, err := http.NewRequest("POST", "http://"+node+":"+DEFAULTPORT+"/election", bytes.NewBuffer(reqBody))
-			fmt.Println("正在向 http://" + node + ":" + DEFAULTPORT + "/election")
+			req, err := http.NewRequest("POST", peerURL(node, "/election"), bytes.NewBuffer(reqBody))
+			fmt.Println("正在向 " + peerURL(node, "/election") + " 发送选举请求")
 			if err != nil {
 				return
 			}
@@ -91,7 +92,7 @@ func (rn *RaftNode) StartElection() {
 			} else if electionResp.VoteGranted {
 				fmt.Println("收到投票， IP: ", node)
 				rn.VoteCount++
-				if rn.VoteCount > uint16(len(rn.NodeIP)/2) {
+				if rn.VoteCount > uint16((len(peers)+1)/2) {
 					fmt.Println("选举成功，当前任期：", rn.Term, "请求任期：", electionResp.Term, "当选 IP: ", rn.LocalIP)
 					rn.VoteCount = 0
 					rn.state = LEADER

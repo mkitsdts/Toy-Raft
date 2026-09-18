@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -32,7 +33,7 @@ func OpenStore(cfg DatabaseConfig) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
-	if err := db.AutoMigrate(&Configuration{}, &SystemSetting{}, &Namespace{}, &Role{}, &RaftLogEntry{}); err != nil {
+	if err := db.AutoMigrate(&Configuration{}, &SystemSetting{}, &Namespace{}, &Role{}, &RaftLogEntry{}, &NodeConfig{}); err != nil {
 		return nil, fmt.Errorf("migrate database: %w", err)
 	}
 	return &Store{db: db}, nil
@@ -273,6 +274,68 @@ func assignNamespaces(tx *gorm.DB, role *Role, namespaces []string) error {
 		objects = append(objects, ns)
 	}
 	return tx.Model(role).Association("Namespaces").Replace(objects)
+}
+
+// ---- raft nodes -------------------------------------------------------------
+
+// ListNodes returns every registered Raft node ordered by id.
+func (s *Store) ListNodes() ([]NodeConfig, error) {
+	nodes := []NodeConfig{}
+	if err := s.db.Order("id asc").Find(&nodes).Error; err != nil {
+		return nil, err
+	}
+	return nodes, nil
+}
+
+// RegisterNode adds a node, or returns the existing row when ip/port already
+// exists. It is safe to call repeatedly with the same address.
+func (s *Store) RegisterNode(ip, port string) (*NodeConfig, error) {
+	node := NodeConfig{IP: ip, Port: port}
+	err := s.db.Where("ip = ? AND port = ?", ip, port).FirstOrCreate(&node).Error
+	if err != nil {
+		return nil, err
+	}
+	return &node, nil
+}
+
+// DeleteNode removes a registered node by id.
+func (s *Store) DeleteNode(id uint) error {
+	result := s.db.Delete(&NodeConfig{}, id)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SeedNodes registers the nodes supplied through the environment on startup.
+// Each entry may be "host" or "host:port"; entries without a port use
+// defaultPort.
+func (s *Store) SeedNodes(addresses []string, defaultPort string) error {
+	for _, addr := range addresses {
+		ip, port := splitHostPort(addr, defaultPort)
+		if ip == "" {
+			continue
+		}
+		if _, err := s.RegisterNode(ip, port); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func splitHostPort(addr, defaultPort string) (string, string) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "", ""
+	}
+	if host, port, err := net.SplitHostPort(addr); err == nil {
+		return host, port
+	}
+	addr = strings.TrimSuffix(strings.TrimPrefix(addr, "["), "]")
+	return addr, defaultPort
 }
 
 func newToken() (string, error) {

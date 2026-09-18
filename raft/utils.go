@@ -3,6 +3,8 @@ package raft
 import (
 	"fmt"
 	"math/rand"
+	"net"
+	"strings"
 	"time"
 )
 
@@ -17,6 +19,27 @@ func RandomDuration() time.Duration {
 	durationDiffMs := int(MAX_DURATION-MIN_DURATION) / int(time.Millisecond)
 	// Generate random milliseconds and convert back to duration
 	return MIN_DURATION + time.Duration(rand.Intn(durationDiffMs))*time.Millisecond
+}
+
+// PeerAddress normalizes a peer node address. Addresses that already contain a
+// port ("host:port", "[::1]:port") are returned unchanged; otherwise the
+// default Raft port is appended.
+func PeerAddress(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return ""
+	}
+	if _, _, err := net.SplitHostPort(addr); err == nil {
+		return addr
+	}
+	addr = strings.TrimSuffix(strings.TrimPrefix(addr, "["), "]")
+	return net.JoinHostPort(addr, DEFAULTPORT)
+}
+
+// peerURL builds the request URL for a peer endpoint, tolerating addresses
+// without an explicit port.
+func peerURL(addr, path string) string {
+	return "http://" + PeerAddress(addr) + path
 }
 
 // 保存日志到数据库：只要有日志就整份写入，不关心提交/应用进度。
