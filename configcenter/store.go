@@ -32,7 +32,7 @@ func OpenStore(cfg DatabaseConfig) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
-	if err := db.AutoMigrate(&Configuration{}, &SystemSetting{}, &Namespace{}, &Role{}); err != nil {
+	if err := db.AutoMigrate(&Configuration{}, &SystemSetting{}, &Namespace{}, &Role{}, &RaftLogEntry{}); err != nil {
 		return nil, fmt.Errorf("migrate database: %w", err)
 	}
 	return &Store{db: db}, nil

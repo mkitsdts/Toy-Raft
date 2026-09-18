@@ -1,17 +1,14 @@
 package raft
 
 import (
-	"encoding/json"
 	"fmt"
 	"math/rand"
-	"os"
 	"time"
 )
 
 const (
 	MIN_DURATION = 2 * time.Second
 	MAX_DURATION = 3 * time.Second
-	LOG_PATH     = "log.json"
 )
 
 // 生成随机数时间间隔
@@ -22,50 +19,26 @@ func RandomDuration() time.Duration {
 	return MIN_DURATION + time.Duration(rand.Intn(durationDiffMs))*time.Millisecond
 }
 
-// 暂时不能保存大量数据
-// 保存日志到磁盘
+// 保存日志到数据库：只要有日志就整份写入，不关心提交/应用进度。
+// 存储层按索引 upsert，所以重复写入是幂等的。
+// 调用方需保证已持有（或无需持有）rn.mux，本函数自身不加锁。
 func PersisLog(rn *RaftNode) {
-
-	if rn.CommitIndex-rn.LastApplied <= 0 {
+	if rn.storage == nil {
+		fmt.Println("未配置日志存储，跳过持久化")
+		return
+	}
+	if len(rn.Log) == 0 {
 		fmt.Println("没有需要保存的日志")
 		return
 	}
 
-	// 判断文件是否存在
-	_, err := os.Stat(LOG_PATH)
-	if err != nil {
-		// 创建文件
-		file, err := os.Create(LOG_PATH)
-		if err != nil {
-			return
-		}
-		defer file.Close()
-	}
-	// 打开文件
-	file, err := os.OpenFile(LOG_PATH, os.O_WRONLY, 0666)
-	if err != nil {
-		return
-	}
-	defer file.Close()
+	entries := make([]LogEntry, len(rn.Log))
+	copy(entries, rn.Log)
 
-	var logs []LogEntry
-	// 读取日志
-	decoder := json.NewDecoder(file)
-	err = decoder.Decode(&logs)
-	if err != nil {
+	fmt.Println("正在写入日志至数据库...")
+	if err := rn.storage.AppendLogEntries(0, entries); err != nil {
+		fmt.Println("写入日志失败：", err)
 		return
 	}
-	fmt.Println("读取日志成功，当前日志数量：", len(logs))
-	fmt.Println("正在写入日志至磁盘...")
-	// 写入日志
-	for i := rn.LastApplied; i < rn.CommitIndex; i++ {
-		logs = append(logs, rn.Log[i])
-	}
-	fmt.Println("写入日志成功，当前日志数量：", len(logs))
-	// 保存日志
-	encoder := json.NewEncoder(file)
-	err = encoder.Encode(logs)
-	if err != nil {
-		return
-	}
+	fmt.Println("写入日志成功，当前日志数量：", len(entries))
 }

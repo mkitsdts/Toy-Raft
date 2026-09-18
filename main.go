@@ -38,6 +38,9 @@ func main() {
 
 	fmt.Println("初始化 Raft 节点...")
 	node := raft.InitRaftNode(cfg.LocalIP, cfg.NodeIPs)
+	if err := node.SetStorage(store); err != nil {
+		log.Fatalf("加载 Raft 日志失败: %v", err)
+	}
 	fmt.Println("Raft 节点初始化完成，节点 IP:", node.LocalIP)
 
 	mux := http.NewServeMux()

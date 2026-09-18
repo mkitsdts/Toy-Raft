@@ -37,6 +37,7 @@ type RaftNode struct {
 	stopCh      chan struct{}
 	stopOnce    sync.Once
 	apply       ApplyFunc
+	storage     LogStorage
 }
 
 func InitRaftNode(localIP string, nodeIPs []string) *RaftNode {
@@ -55,6 +56,23 @@ func InitRaftNode(localIP string, nodeIPs []string) *RaftNode {
 }
 
 func (rn *RaftNode) SetApplyFunc(fn ApplyFunc) { rn.mux.Lock(); rn.apply = fn; rn.mux.Unlock() }
+
+// SetStorage attaches the persistence backend and restores the persisted log
+// into memory. It must be called before Run so the election/heartbeat loop
+// observes the recovered log.
+func (rn *RaftNode) SetStorage(s LogStorage) error {
+	entries, err := s.LoadLogEntries()
+	if err != nil {
+		return err
+	}
+	rn.mux.Lock()
+	defer rn.mux.Unlock()
+	rn.storage = s
+	if len(entries) > 0 {
+		rn.Log = entries
+	}
+	return nil
+}
 
 func (rn *RaftNode) IsLeader() bool {
 	rn.mux.RLock()

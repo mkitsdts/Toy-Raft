@@ -92,8 +92,8 @@ func (rn *RaftNode) HandleAppendEntries(w http.ResponseWriter, r *http.Request) 
 	// 更新日志
 	rn.Log = append(rn.Log, reqInfo.Entries...)
 	// 更新提交索引
-	if reqInfo.LeaderCommit > rn.Log[len(rn.Log)-1].Term {
-		rn.Log[len(rn.Log)-1].Term = reqInfo.LeaderCommit
+	if reqInfo.LeaderCommit > rn.CommitIndex {
+		rn.CommitIndex = min(reqInfo.LeaderCommit, len(rn.Log)-1)
 	}
 	// 返回日志
 	var respInfo AppendEntriesResp
