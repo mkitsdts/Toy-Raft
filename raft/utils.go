@@ -11,6 +11,7 @@ import (
 const (
 	MIN_DURATION = 2 * time.Second
 	MAX_DURATION = 3 * time.Second
+	LOG_PATH     = "log.json"
 )
 
 // 生成随机数时间间隔

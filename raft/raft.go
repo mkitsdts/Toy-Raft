@@ -1,10 +1,9 @@
 package raft
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"sync"
 	"time"
 )
@@ -15,11 +14,13 @@ const (
 	LEADER    uint8 = 2
 )
 
-const (
-	LOG_PATH         = "log.json"
-	RAFT_CONFIG_PATH = "raft.json"
-)
+var ErrNotLeader = errors.New("not raft leader")
 
+type ApplyFunc func(Command) error
+
+// RaftNode is a small Raft node used by the configuration center. All mutable
+// application data is represented by Command values and is applied only after
+// a majority has acknowledged its log entry.
 type RaftNode struct {
 	mux         sync.RWMutex
 	state       uint8
@@ -32,103 +33,102 @@ type RaftNode struct {
 	NodeIP      []string `json:"node_ip"`
 	LeaderIP    string   `json:"leader_ip"`
 	Log         []LogEntry
-	stateChan   chan struct{} // 添加状态变化通知通道
+	stateChan   chan struct{}
+	stopCh      chan struct{}
+	stopOnce    sync.Once
+	apply       ApplyFunc
 }
 
-func InitRaftNode() *RaftNode {
-	// 读取配置文件
-	file, err := os.Open(RAFT_CONFIG_PATH)
-	if err != nil {
-		panic(err)
+func InitRaftNode(localIP string, nodeIPs []string) *RaftNode {
+	n := &RaftNode{
+		state: FOLLOWER, Term: TERM_MIN, LocalIP: localIP, NodeIP: nodeIPs,
+		CommitIndex: -1, LastApplied: -1, stateChan: make(chan struct{}, 1),
+		stopCh: make(chan struct{}),
+		Log:    make([]LogEntry, 0),
 	}
-	defer file.Close()
-
-	decoder := json.NewDecoder(file)
-
-	type Config struct {
-		LocalIP string   `json:"local_ip"`
-		NodeIP  []string `json:"node_ip"`
+	// A one-node cluster has a majority immediately.
+	if len(nodeIPs) == 0 {
+		n.state = LEADER
+		n.LeaderIP = localIP
 	}
-	config := Config{}
-	node := RaftNode{}
-	err = decoder.Decode(&config)
-	if err != nil {
-		panic(err)
-	}
-	node.state = FOLLOWER
-	node.Term = TERM_MIN
-	node.VoteCount = 0
-	node.LeaderIP = ""
-	node.VotedFor = ""
-	node.LocalIP = config.LocalIP
-	node.NodeIP = config.NodeIP
-	node.CommitIndex = 0
-	node.LastApplied = 0
-	node.mux = sync.RWMutex{}
-	node.stateChan = make(chan struct{}, 1)
-	node.Log = make([]LogEntry, 0)
-	return &node
+	return n
 }
 
-func (rn *RaftNode) Start() {
+func (rn *RaftNode) SetApplyFunc(fn ApplyFunc) { rn.mux.Lock(); rn.apply = fn; rn.mux.Unlock() }
+
+func (rn *RaftNode) IsLeader() bool {
+	rn.mux.RLock()
+	defer rn.mux.RUnlock()
+	return rn.state == LEADER
+}
+func (rn *RaftNode) Leader() string { rn.mux.RLock(); defer rn.mux.RUnlock(); return rn.LeaderIP }
+func (rn *RaftNode) Status() map[string]any {
+	rn.mux.RLock()
+	defer rn.mux.RUnlock()
+	states := []string{"follower", "candidate", "leader"}
+	return map[string]any{"state": states[rn.state], "term": rn.Term, "leader": rn.LeaderIP, "local_ip": rn.LocalIP, "commit_index": rn.CommitIndex}
+}
+
+func (rn *RaftNode) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("POST /logentry", rn.HandleAppendEntries)
+	mux.HandleFunc("POST /election", rn.HandleElection)
+	mux.HandleFunc("POST /heartbeat", rn.HandleHeartbeat)
+}
+
+func (rn *RaftNode) notify() {
+	select {
+	case rn.stateChan <- struct{}{}:
+	default:
+	}
+}
+
+func (rn *RaftNode) Run() {
+	if len(rn.NodeIP) == 0 {
+		return
+	}
 	go func() {
 		for {
 			rn.mux.RLock()
-			currentState := rn.state
+			state := rn.state
 			rn.mux.RUnlock()
-
-			switch currentState {
-			case FOLLOWER:
-				// 使用select同时等待超时和状态变化
-				select {
-				case <-time.After(HEARTBEAT_TIMEOUT):
-					// 心跳超时，变为候选人
-					rn.state = CANDIDATE
-					fmt.Println("心跳超时，变为候选人...")
-				case <-rn.stateChan:
-					// 状态已变化，继续下一次循环
-					fmt.Println("收到状态变化通知")
-				}
-
-			case CANDIDATE:
-				// 开始选举
-				fmt.Println("开始新一轮选举...")
-				rn.StartElection()
-
-				// 使用select等待选举结果或状态变化
-				select {
-				case <-time.After(RandomDuration()):
-					// 选举超时，重新开始选举
-					fmt.Println("选举超时，准备重新选举...")
-				case <-rn.stateChan:
-					// 状态已变化(可能成为Leader或回到Follower)
-					fmt.Println("选举过程中收到状态变化通知")
-				}
-
-			case LEADER:
-				// 作为Leader发送心跳
+			if state == LEADER {
 				rn.SendHeartbeat()
-				time.Sleep(HEARTBEAT_PERIOD)
-
-				// 检查是否仍然是Leader
-				rn.mux.RLock()
-				stillLeader := rn.state == LEADER
-				rn.mux.RUnlock()
-
-				if !stillLeader {
-					// 不再是Leader，发送通知以更新循环
-					select {
-					case rn.stateChan <- struct{}{}:
-					default:
-					}
+				select {
+				case <-rn.stopCh:
+					return
+				case <-time.After(HEARTBEAT_PERIOD):
 				}
+				continue
+			}
+			timer := time.NewTimer(RandomDuration())
+			select {
+			case <-timer.C:
+				rn.mux.Lock()
+				rn.state = CANDIDATE
+				rn.mux.Unlock()
+				rn.StartElection()
+			case <-rn.stateChan:
+				timer.Stop()
+			case <-rn.stopCh:
+				timer.Stop()
+				return
 			}
 		}
 	}()
-	http.HandleFunc("/logentry", rn.HandleAppendEntries)
-	http.HandleFunc("/election", rn.HandleElection)
-	http.HandleFunc("/heartbeat", rn.HandleHeartbeat)
+}
+
+// Stop asks the background election/heartbeat loop to exit. It is safe to call
+// multiple times.
+func (rn *RaftNode) Stop() {
+	rn.stopOnce.Do(func() { close(rn.stopCh) })
+}
+
+func (rn *RaftNode) Start() {
+	mux := http.NewServeMux()
+	rn.RegisterRoutes(mux)
+	rn.Run()
 	fmt.Println("Raft 节点启动完成")
-	// 启动 HTTP 服务器
-	http.ListenAndServe(fmt.Sprintf(":%s", DEFAULTPORT), nil)
+	if err := http.ListenAndServe(":"+DEFAULTPORT, mux); err != nil {
+		panic(err)
+	}
 }
