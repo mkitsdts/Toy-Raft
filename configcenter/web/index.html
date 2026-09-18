@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Raft 配置中心</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+    curl --location 'http://dify.umcasual.com/v1/workflows/run' \
+    --header 'Authorization: Bearer app-EhTm9tmRnkZP5nW0Qdiv2QlL' \
+    --header 'Content-Type: application/json' \
+    --data '{
+        "inputs": {
+            "core_keyword": "wireless bluetooth earbuds",
+            "long_tail_keywords": "wireless earbuds noise cancelling long battery\nsports earbuds waterproof open ear\n2025 bluetooth earbuds best value",
+            "product_description": "ANC sports wireless earbuds, open-ear design, 12h single charge, 40h with charging case, IPX5 waterproof, Bluetooth 5.3, low-latency gaming mode. Target: 18-35 sports users.",
+            "page_type": "Category Page",
+            "page_type_rule": "指定的页面类型具有最高优先级，并应贯穿Top 10分析、Topic选择、模块类型判断、内容大纲设计和最终文案撰写的全过程。不要默认每个核心关键词对应的页面都是首页。",
+            "reference_img": {
+                "transfer_method": "local_file",
+                "type": "image",
+                "upload_file_id": "5bab4f22-e211-4788-bd63-0ae4732bab34"
+            },
+            "inject_imgs": [
+                {
+                    "transfer_method": "local_file",
+                    "type": "image",
+                    "upload_file_id": "5bab4f22-e211-4788-bd63-0ae4732bab34"
+                },
+                {
+                    "transfer_method": "local_file",
+                    "type": "image",
+                    "upload_file_id": "5bab4f22-e211-4788-bd63-0ae4732bab34"
+                }
+            ]
+        },
+        "response_mode": "streaming",
+        "user": "abc-123"
+    }'
+
+<!-- 登录页 -->
+<div id="login-view" class="login-wrap hidden">
+  <div class="login-card">
+    <h1>Raft 配置中心</h1>
+    <p class="muted">请输入管理 Token 或角色 Token 登录</p>
+    <input id="token-input" type="password" placeholder="Auth Token" autocomplete="off">
+    <button id="login-btn" class="btn primary block">登录</button>
+    <div id="login-error" class="error-text"></div>
+  </div>
+</div>
+
+<!-- 主界面 -->
+<div id="app-view" class="hidden">
+  <header class="topbar">
+    <div class="brand">Raft 配置中心</div>
+    <nav id="tabs">
+      <button class="tab active" data-tab="configs">配置管理</button>
+      <button class="tab admin-only" data-tab="roles">角色管理</button>
+    </nav>
+    <div class="topbar-right">
+      <span id="identity-badge" class="badge"></span>
+      <button id="logout-btn" class="btn">退出</button>
+    </div>
+  </header>
+
+  <!-- 配置管理 -->
+  <main id="tab-configs" class="tab-page">
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <span>命名空间</span>
+        <button id="new-config-btn" class="btn small primary admin-only">+ 新建配置</button>
+      </div>
+      <ul id="namespace-list" class="ns-list"></ul>
+    </aside>
+    <section class="content">
+      <div id="config-empty" class="empty">← 请选择左侧命名空间</div>
+      <div id="config-panel" class="hidden">
+        <div class="content-head">
+          <h2 id="current-namespace"></h2>
+          <input id="config-filter" type="search" placeholder="筛选 key...">
+        </div>
+        <table class="table">
+          <thead>
+            <tr><th>Key</th><th>格式</th><th>版本</th><th>更新时间</th><th class="admin-only">操作</th></tr>
+          </thead>
+          <tbody id="config-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <!-- 角色管理 -->
+  <main id="tab-roles" class="tab-page hidden">
+    <section class="content full">
+      <div class="content-head">
+        <h2>角色</h2>
+        <button id="new-role-btn" class="btn primary">+ 新建角色</button>
+      </div>
+      <p class="muted">角色 Token 只能读取其授权命名空间下的配置。</p>
+      <table class="table">
+        <thead>
+          <tr><th>名称</th><th>描述</th><th>命名空间</th><th>Token</th><th>创建时间</th><th>操作</th></tr>
+        </thead>
+        <tbody id="role-tbody"></tbody>
+      </table>
+    </section>
+  </main>
+</div>
+
+<!-- 配置编辑弹窗 -->
+<div id="config-modal" class="modal-mask hidden">
+  <div class="modal wide">
+    <h3 id="config-modal-title">新建配置</h3>
+    <label>命名空间</label>
+    <input id="cfg-namespace" list="namespace-datalist" placeholder="例如 app-payment">
+    <datalist id="namespace-datalist"></datalist>
+    <label>Key</label>
+    <input id="cfg-key" placeholder="例如 database">
+    <label>格式</label>
+    <select id="cfg-format">
+      <option value="text">text</option>
+      <option value="json">json</option>
+      <option value="yaml">yaml</option>
+    </select>
+    <label>内容 <span id="cfg-version" class="muted"></span></label>
+    <textarea id="cfg-value" rows="12" spellcheck="false" placeholder="配置内容..."></textarea>
+    <div id="cfg-error" class="error-text"></div>
+    <div class="modal-actions">
+      <button id="cfg-cancel" class="btn">取消</button>
+      <button id="cfg-save" class="btn primary">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 角色编辑弹窗 -->
+<div id="role-modal" class="modal-mask hidden">
+  <div class="modal">
+    <h3 id="role-modal-title">新建角色</h3>
+    <label>名称</label>
+    <input id="role-name" placeholder="例如 payment-service">
+    <label>描述</label>
+    <input id="role-desc" placeholder="可选">
+    <label>授权命名空间</label>
+    <div id="role-ns-box" class="ns-checks"></div>
+    <div id="role-error" class="error-text"></div>
+    <div class="modal-actions">
+      <button id="role-cancel" class="btn">取消</button>
+      <button id="role-save" class="btn primary">保存</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
