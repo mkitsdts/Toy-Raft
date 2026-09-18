@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -15,15 +14,37 @@ const (
 	LEADER    uint8 = 2
 )
 
-var ErrNotLeader = errors.New("not raft leader")
+// NotLeaderError is returned by Apply when this node is not the leader. It
+// carries the address of the leader (when known) so HTTP handlers can redirect
+// the write to the right node.
+type NotLeaderError struct {
+	Leader string
+}
 
+func (e *NotLeaderError) Error() string {
+	if e.Leader == "" {
+		return "raft: not leader (leader unknown)"
+	}
+	return "raft: not leader, current leader is " + e.Leader
+}
+
+// ApplyFunc is the state machine. It is invoked once per committed log entry,
+// in log order, on every node. It must be deterministic: replaying the same
+// command must produce the same result.
 type ApplyFunc func(Command) error
 
 // RaftNode is a small Raft node used by the configuration center. All mutable
 // application data is represented by Command values and is applied only after
 // a majority has acknowledged its log entry.
 type RaftNode struct {
-	mux         sync.RWMutex
+	mux sync.RWMutex
+	// writeMux serializes client writes, commit application and peer
+	// replication so log indexes never interleave.
+	writeMux sync.Mutex
+	// applyMux serializes applying committed entries to the state machine. The
+	// state machine runs without mux held, so it may safely call back into the
+	// node (e.g. to update the peer list after a membership command).
+	applyMux    sync.Mutex
 	state       uint8
 	Term        int      // 当前任期
 	VoteCount   uint16   // 获得的选票数
@@ -34,19 +55,23 @@ type RaftNode struct {
 	NodeIP      []string `json:"node_ip"`
 	LeaderIP    string   `json:"leader_ip"`
 	Log         []LogEntry
-	stateChan   chan struct{}
-	stopCh      chan struct{}
-	stopOnce    sync.Once
-	apply       ApplyFunc
-	storage     LogStorage
+	// nextIndex tracks, per peer, the next log index to replicate. It is
+	// rebuilt whenever this node becomes leader.
+	nextIndex map[string]int
+	stateChan chan struct{}
+	stopCh    chan struct{}
+	stopOnce  sync.Once
+	apply     ApplyFunc
+	storage   LogStorage
 }
 
 func InitRaftNode(localIP string, nodeIPs []string) *RaftNode {
 	n := &RaftNode{
 		state: FOLLOWER, Term: TERM_MIN, LocalIP: strings.TrimSpace(localIP),
 		CommitIndex: -1, LastApplied: -1, stateChan: make(chan struct{}, 1),
-		stopCh: make(chan struct{}),
-		Log:    make([]LogEntry, 0),
+		stopCh:    make(chan struct{}),
+		Log:       make([]LogEntry, 0),
+		nextIndex: make(map[string]int),
 	}
 	// SetNodes also promotes an empty cluster to a single-node leader, which is
 	// the majority immediately.
@@ -75,6 +100,14 @@ func (rn *RaftNode) SetNodes(addrs []string) {
 
 	rn.mux.Lock()
 	rn.NodeIP = nodes
+	if rn.nextIndex == nil {
+		rn.nextIndex = make(map[string]int)
+	}
+	for _, peer := range nodes {
+		if _, ok := rn.nextIndex[peer]; !ok {
+			rn.nextIndex[peer] = len(rn.Log)
+		}
+	}
 	if len(nodes) == 0 && rn.state != LEADER {
 		rn.state = LEADER
 		rn.LeaderIP = rn.LocalIP
@@ -91,9 +124,23 @@ func (rn *RaftNode) Nodes() []string { return rn.peerList() }
 func (rn *RaftNode) peerList() []string {
 	rn.mux.RLock()
 	defer rn.mux.RUnlock()
+	return rn.peerListLocked()
+}
+
+// peerListLocked is peerList for callers that already hold rn.mux.
+func (rn *RaftNode) peerListLocked() []string {
 	out := make([]string, len(rn.NodeIP))
 	copy(out, rn.NodeIP)
 	return out
+}
+
+// lastLogIndexTermLocked returns the index and term of the last log entry, or
+// (-1, 0) for an empty log. Callers must hold rn.mux.
+func (rn *RaftNode) lastLogIndexTermLocked() (int, int) {
+	if len(rn.Log) == 0 {
+		return -1, 0
+	}
+	return len(rn.Log) - 1, rn.Log[len(rn.Log)-1].Term
 }
 
 func (rn *RaftNode) SetApplyFunc(fn ApplyFunc) { rn.mux.Lock(); rn.apply = fn; rn.mux.Unlock() }
@@ -111,6 +158,19 @@ func (rn *RaftNode) SetStorage(s LogStorage) error {
 	rn.storage = s
 	if len(entries) > 0 {
 		rn.Log = entries
+		// Persisted entries are treated as committed. The application state
+		// machine (the configurations table) is persisted as well, so there is
+		// no need to replay on startup.
+		rn.CommitIndex = len(entries) - 1
+		rn.LastApplied = len(entries) - 1
+	}
+	if rn.nextIndex == nil {
+		rn.nextIndex = make(map[string]int)
+	}
+	for _, peer := range rn.NodeIP {
+		if _, ok := rn.nextIndex[peer]; !ok {
+			rn.nextIndex[peer] = len(rn.Log)
+		}
 	}
 	return nil
 }
@@ -125,7 +185,11 @@ func (rn *RaftNode) Status() map[string]any {
 	rn.mux.RLock()
 	defer rn.mux.RUnlock()
 	states := []string{"follower", "candidate", "leader"}
-	return map[string]any{"state": states[rn.state], "term": rn.Term, "leader": rn.LeaderIP, "local_ip": rn.LocalIP, "commit_index": rn.CommitIndex}
+	return map[string]any{
+		"state": states[rn.state], "term": rn.Term, "leader": rn.LeaderIP,
+		"local_ip": rn.LocalIP, "commit_index": rn.CommitIndex,
+		"last_applied": rn.LastApplied, "last_log_index": len(rn.Log) - 1,
+	}
 }
 
 func (rn *RaftNode) RegisterRoutes(mux *http.ServeMux) {
@@ -138,6 +202,262 @@ func (rn *RaftNode) notify() {
 	select {
 	case rn.stateChan <- struct{}{}:
 	default:
+	}
+}
+
+// becomeLeaderLocked promotes this node and (re)builds the replication
+// progress for every peer. Callers must hold rn.mux.
+func (rn *RaftNode) becomeLeaderLocked() {
+	rn.state = LEADER
+	rn.LeaderIP = rn.LocalIP
+	rn.VoteCount = 0
+	rn.nextIndex = make(map[string]int, len(rn.NodeIP))
+	for _, peer := range rn.NodeIP {
+		rn.nextIndex[peer] = len(rn.Log)
+	}
+}
+
+// stepDown abandons leadership when a higher term is observed.
+func (rn *RaftNode) stepDown(term int) {
+	rn.mux.Lock()
+	if term > rn.Term {
+		rn.Term = term
+		rn.state = FOLLOWER
+		rn.LeaderIP = ""
+		rn.VotedFor = ""
+		rn.VoteCount = 0
+	}
+	rn.mux.Unlock()
+	rn.notify()
+}
+
+// Apply proposes a client command. On the leader it appends the command to the
+// log, replicates it to a majority, commits it and applies it to the state
+// machine before returning. A non-leader returns *NotLeaderError. Apply is
+// serialized with a dedicated mutex so concurrent clients cannot interleave
+// log indexes.
+func (rn *RaftNode) Apply(cmd Command) (int, error) {
+	rn.writeMux.Lock()
+	defer rn.writeMux.Unlock()
+
+	rn.mux.Lock()
+	if rn.state != LEADER {
+		leader := rn.LeaderIP
+		rn.mux.Unlock()
+		return -1, &NotLeaderError{Leader: leader}
+	}
+	rn.Log = append(rn.Log, LogEntry{Term: rn.Term, Comm: cmd})
+	index := len(rn.Log) - 1
+	peers := rn.peerListLocked()
+	rn.mux.Unlock()
+
+	// Persist before replicating so a crash cannot lose an acknowledged entry.
+	rn.persist()
+
+	if len(peers) > 0 {
+		need := (len(peers)+1)/2 + 1
+		acked := rn.replicateQuorum(peers, index, need)
+		if len(acked)+1 < need {
+			return index, fmt.Errorf("raft: quorum not reached for entry %d (%d/%d nodes)", index, len(acked)+1, len(peers)+1)
+		}
+		rn.commitTo(index)
+		// Propagate the new commit index to the peers that are up so they apply
+		// the entry promptly. Unreachable peers catch up via heartbeat.
+		for _, peer := range acked {
+			go rn.replicateTo(peer, index)
+		}
+		return index, nil
+	}
+
+	rn.commitTo(index)
+	return index, nil
+}
+
+// replicateQuorum replicates up to target to every peer concurrently and
+// returns the peers that acknowledged. It returns as soon as the caller plus
+// the acknowledged peers form a majority (need), so a single slow or
+// unreachable peer cannot stall a write that already has quorum.
+func (rn *RaftNode) replicateQuorum(peers []string, target, need int) []string {
+	type result struct {
+		peer string
+		ok   bool
+	}
+	ch := make(chan result, len(peers))
+	for _, peer := range peers {
+		go func(p string) { ch <- result{p, rn.replicateTo(p, target)} }(peer)
+	}
+
+	acked := make([]string, 0, len(peers))
+	for range peers {
+		r := <-ch
+		if r.ok {
+			acked = append(acked, r.peer)
+			if len(acked)+1 >= need {
+				break // remaining goroutines still finish and drain into ch
+			}
+		}
+	}
+	return acked
+}
+
+// replicateTo sends log entries up to target to one peer, backing off on
+// consistency mismatches until the follower accepts. It returns true when the
+// peer's log is up to date with target.
+func (rn *RaftNode) replicateTo(peer string, target int) bool {
+	for attempt := 0; attempt <= 256; attempt++ {
+		rn.mux.Lock()
+		if rn.state != LEADER {
+			rn.mux.Unlock()
+			return false
+		}
+		next, ok := rn.nextIndex[peer]
+		if !ok || next < 0 {
+			next = 0
+		}
+		if next > len(rn.Log) {
+			next = len(rn.Log)
+		}
+		end := target + 1
+		if end > len(rn.Log) {
+			end = len(rn.Log)
+		}
+		if next > end {
+			next = end
+		}
+		prevIndex := next - 1
+		prevTerm := 0
+		if prevIndex >= 0 && prevIndex < len(rn.Log) {
+			prevTerm = rn.Log[prevIndex].Term
+		}
+		entries := make([]LogEntry, end-next)
+		copy(entries, rn.Log[next:end])
+		req := AppendEntriesReq{
+			Term:         rn.Term,
+			LeaderIP:     rn.LocalIP,
+			PrevLogIndex: prevIndex,
+			PrevLogTerm:  prevTerm,
+			Entries:      entries,
+			LeaderCommit: rn.CommitIndex,
+		}
+		term := rn.Term
+		wasBottom := next == 0
+		rn.mux.Unlock()
+
+		resp, err := postAppendEntries(peer, "/logentry", req)
+		if err != nil {
+			return false
+		}
+		if resp.Term > term {
+			rn.stepDown(resp.Term)
+			return false
+		}
+		if resp.Success {
+			rn.mux.Lock()
+			if end > rn.nextIndex[peer] {
+				rn.nextIndex[peer] = end
+			}
+			rn.mux.Unlock()
+			return true
+		}
+		// The follower rejected on a consistency mismatch: back off one entry
+		// and try again.
+		rn.mux.Lock()
+		if rn.nextIndex[peer] > 0 {
+			rn.nextIndex[peer]--
+		}
+		rn.mux.Unlock()
+		if wasBottom {
+			return false
+		}
+	}
+	return false
+}
+
+// ProbePeer brings an as-yet-unconfigured peer up to date with the leader's
+// log and reports whether it was reachable. It is used before adding a node to
+// the cluster so an unreachable node is never committed into the peer set
+// (which would otherwise make the cluster require a vote it cannot get). The
+// peer is not added to the configuration here; that happens when the
+// node.register command is applied.
+func (rn *RaftNode) ProbePeer(addr string) bool {
+	peer := PeerAddress(addr)
+	if peer == "" || peer == PeerAddress(rn.LocalIP) {
+		return true
+	}
+
+	rn.mux.Lock()
+	if rn.state != LEADER {
+		rn.mux.Unlock()
+		return false
+	}
+	if rn.nextIndex == nil {
+		rn.nextIndex = make(map[string]int)
+	}
+	if _, ok := rn.nextIndex[peer]; !ok {
+		rn.nextIndex[peer] = 0 // send the whole log so the new node catches up
+	}
+	target := len(rn.Log) - 1
+	rn.mux.Unlock()
+
+	fmt.Println("正在探测新节点:", peer)
+	return rn.replicateTo(peer, target)
+}
+
+// commitTo advances the commit index to index (when newer) and applies every
+// newly committed entry to the state machine.
+func (rn *RaftNode) commitTo(index int) {
+	rn.mux.Lock()
+	if index > rn.CommitIndex {
+		rn.CommitIndex = index
+	}
+	rn.mux.Unlock()
+	rn.drainApply()
+	rn.persist()
+}
+
+// drainApply applies every committed-but-not-yet-applied entry, in order and
+// exactly once. It is safe to call concurrently: applyMux serializes callers and
+// LastApplied is advanced under mux before the state machine runs, so an entry is
+// never applied twice. The state machine is invoked with mux released.
+func (rn *RaftNode) drainApply() {
+	rn.applyMux.Lock()
+	defer rn.applyMux.Unlock()
+
+	for {
+		rn.mux.Lock()
+		if rn.LastApplied >= rn.CommitIndex || rn.LastApplied+1 >= len(rn.Log) {
+			rn.mux.Unlock()
+			return
+		}
+		rn.LastApplied++
+		index := rn.LastApplied
+		entry := rn.Log[index]
+		apply := rn.apply
+		rn.mux.Unlock()
+
+		if apply == nil {
+			continue
+		}
+		if err := apply(entry.Comm); err != nil {
+			fmt.Printf("raft: apply log[%d] failed: %v\n", index, err)
+		}
+	}
+}
+
+// persist writes the whole in-memory log to the storage backend. The backend
+// upserts by index, so repeated writes are idempotent.
+func (rn *RaftNode) persist() {
+	rn.mux.RLock()
+	storage := rn.storage
+	entries := make([]LogEntry, len(rn.Log))
+	copy(entries, rn.Log)
+	rn.mux.RUnlock()
+
+	if storage == nil || len(entries) == 0 {
+		return
+	}
+	if err := storage.AppendLogEntries(0, entries); err != nil {
+		fmt.Println("raft: persist log failed:", err)
 	}
 }
 

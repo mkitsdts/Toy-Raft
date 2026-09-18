@@ -12,6 +12,7 @@ import (
 	"gopkg.in/yaml.v3"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var ErrNotFound = errors.New("record not found")
@@ -164,6 +165,25 @@ func ensureNamespace(tx *gorm.DB, name string) error {
 	return tx.Where("name = ?", name).FirstOrCreate(&ns).Error
 }
 
+// CreateNamespace inserts a namespace, or does nothing when it already exists.
+func (s *Store) CreateNamespace(name string) error {
+	ns := Namespace{Name: name}
+	return s.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&ns).Error
+}
+
+// DeleteNamespace removes a namespace together with its configurations and any
+// role grant referencing it.
+func (s *Store) DeleteNamespace(name string) error {
+	var count int64
+	if err := s.db.Model(&Namespace{}).Where("name = ?", name).Count(&count).Error; err != nil {
+		return err
+	}
+	if count == 0 {
+		return ErrNotFound
+	}
+	return s.applyNamespaceDelete(namespacePayload{Name: name})
+}
+
 // ---- roles ------------------------------------------------------------------
 
 func (s *Store) ListRoles() ([]Role, error) {
@@ -189,6 +209,21 @@ func (s *Store) RoleByID(id uint) (*Role, error) {
 func (s *Store) RoleByToken(token string) (*Role, error) {
 	var role Role
 	err := s.db.Preload("Namespaces").Where("token = ?", token).First(&role).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &role, nil
+}
+
+// RoleByName looks a role up by its unique name. It is used to return the
+// freshly created role after a replicated role.create command, without relying
+// on the auto-increment id.
+func (s *Store) RoleByName(name string) (*Role, error) {
+	var role Role
+	err := s.db.Preload("Namespaces").Where("name = ?", name).First(&role).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, ErrNotFound
 	}
@@ -292,6 +327,32 @@ func (s *Store) ListNodes() ([]NodeConfig, error) {
 func (s *Store) RegisterNode(ip, port string) (*NodeConfig, error) {
 	node := NodeConfig{IP: ip, Port: port}
 	err := s.db.Where("ip = ? AND port = ?", ip, port).FirstOrCreate(&node).Error
+	if err != nil {
+		return nil, err
+	}
+	return &node, nil
+}
+
+// NodeByAddress looks up a registered node by its unique ip/port pair.
+func (s *Store) NodeByAddress(ip, port string) (*NodeConfig, error) {
+	var node NodeConfig
+	err := s.db.Where("ip = ? AND port = ?", ip, port).First(&node).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &node, nil
+}
+
+// NodeByID looks up a registered node by its id.
+func (s *Store) NodeByID(id uint) (*NodeConfig, error) {
+	var node NodeConfig
+	err := s.db.First(&node, id).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, ErrNotFound
+	}
 	if err != nil {
 		return nil, err
 	}

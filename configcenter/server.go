@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+
+	"nexus/raft"
 )
 
 const maxBodySize = 1 << 20 // 1 MiB
@@ -34,6 +36,17 @@ type Server struct {
 	store *Store
 	token string
 	nodes NodeRegistrar
+	raft  RaftApplier
+}
+
+// RaftApplier is the subset of *raft.RaftNode used by the HTTP layer to route
+// configuration writes through the replicated log. It may be left unset in
+// tests, in which case writes go straight to the local store.
+type RaftApplier interface {
+	Apply(cmd raft.Command) (int, error)
+	IsLeader() bool
+	Leader() string
+	ProbePeer(addr string) bool
 }
 
 // NodeRegistrar receives the full peer address list whenever the set of
@@ -61,6 +74,10 @@ type roleRequest struct {
 	Namespaces  []string `json:"namespaces"`
 }
 
+type namespaceRequest struct {
+	Name string `json:"name"`
+}
+
 func NewServer(store *Store, token string) *Server {
 	return &Server{store: store, token: token}
 }
@@ -68,6 +85,9 @@ func NewServer(store *Store, token string) *Server {
 // SetNodeRegistrar wires the running Raft node so node registrations take
 // effect immediately. It may be left unset in tests.
 func (s *Server) SetNodeRegistrar(r NodeRegistrar) { s.nodes = r }
+
+// SetRaft wires the running Raft node so configuration writes are replicated.
+func (s *Server) SetRaft(r RaftApplier) { s.raft = r }
 
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	// API
@@ -77,6 +97,8 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("GET /api/v1/configs/{namespace}/{key}", s.auth(http.HandlerFunc(s.handleGetConfig)))
 	mux.Handle("DELETE /api/v1/configs/{namespace}/{key}", s.auth(s.requireAdmin(http.HandlerFunc(s.handleDeleteConfig))))
 	mux.Handle("GET /api/v1/namespaces", s.auth(http.HandlerFunc(s.handleListNamespaces)))
+	mux.Handle("POST /api/v1/namespaces", s.auth(s.requireAdmin(http.HandlerFunc(s.handleCreateNamespace))))
+	mux.Handle("DELETE /api/v1/namespaces/{name}", s.auth(s.requireAdmin(http.HandlerFunc(s.handleDeleteNamespace))))
 	mux.Handle("GET /api/v1/roles", s.auth(s.requireAdmin(http.HandlerFunc(s.handleListRoles))))
 	mux.Handle("POST /api/v1/roles", s.auth(s.requireAdmin(http.HandlerFunc(s.handleCreateRole))))
 	mux.Handle("PUT /api/v1/roles/{id}", s.auth(s.requireAdmin(http.HandlerFunc(s.handleUpdateRole))))
@@ -159,13 +181,37 @@ func (s *Server) handleCreateConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	configuration, err := s.store.Put(req.Namespace, req.Key, req.Value, req.Format)
-	if errors.Is(err, ErrInvalidFormat) {
+	// Validate before proposing so an invalid value never enters the log.
+	if err := ValidateFormat(req.Format, req.Value); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err != nil {
+
+	if s.raft != nil {
+		// Replicate the write through Raft; the state machine performs the
+		// actual store.Put on every node once the entry is committed.
+		cmd, err := newCommand(OpConfigPut, configPutPayload{
+			Namespace: req.Namespace, Key: req.Key, Value: req.Value, Format: req.Format,
+		})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to encode configuration command")
+			return
+		}
+		if handled, committed := s.replicate(w, r, cmd); handled && !committed {
+			return
+		}
+	} else if _, err := s.store.Put(req.Namespace, req.Key, req.Value, req.Format); err != nil {
+		if errors.Is(err, ErrInvalidFormat) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "failed to save configuration")
+		return
+	}
+
+	configuration, err := s.store.Get(req.Namespace, req.Key)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load saved configuration")
 		return
 	}
 	writeJSON(w, http.StatusOK, configuration)
@@ -194,12 +240,77 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 
 // DELETE /api/v1/configs/{namespace}/{key} removes a configuration. Admin only.
 func (s *Server) handleDeleteConfig(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.Delete(r.PathValue("namespace"), r.PathValue("key")); err != nil {
+	namespace, key := r.PathValue("namespace"), r.PathValue("key")
+
+	if s.raft != nil {
+		cmd, err := newCommand(OpConfigDelete, configDeletePayload{Namespace: namespace, Key: key})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to encode delete command")
+			return
+		}
+		if handled, committed := s.replicate(w, r, cmd); handled {
+			if committed {
+				w.WriteHeader(http.StatusNoContent)
+			}
+			return
+		}
+	}
+
+	if err := s.store.Delete(namespace, key); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			writeError(w, http.StatusNotFound, "configuration not found")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "failed to delete configuration")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+
+// redirectToLeader responds with a 307 pointing at the current Raft leader when
+// err is a *raft.NotLeaderError. It reports whether it wrote a response.
+func (s *Server) redirectToLeader(w http.ResponseWriter, r *http.Request, err error) bool {
+	var notLeader *raft.NotLeaderError
+	if !errors.As(err, &notLeader) {
+		return false
+	}
+	leader := notLeader.Leader
+	if leader == "" && s.raft != nil {
+		leader = s.raft.Leader()
+	}
+	if leader == "" {
+		writeError(w, http.StatusServiceUnavailable, "no Raft leader elected yet, retry shortly")
+		return true
+	}
+	address := raft.PeerAddress(leader)
+	w.Header().Set("Location", "http://"+address+r.URL.RequestURI())
+	w.Header().Set("X-Raft-Leader", address)
+	writeJSON(w, http.StatusTemporaryRedirect, map[string]string{"error": "not leader", "leader": address})
+	return true
+}
+
+// replicate proposes cmd through the Raft log. It returns (handled, committed).
+// When handled is true a response has been written and the caller must return.
+// When committed is true the command was applied to the local state machine.
+// When no Raft node is wired (tests) it returns (false, false) so the caller can
+// fall back to a direct local write.
+func (s *Server) replicate(w http.ResponseWriter, r *http.Request, cmd raft.Command) (handled, committed bool) {
+	if s.raft == nil {
+		return false, false
+	}
+	if _, err := s.raft.Apply(cmd); err != nil {
+		if s.redirectToLeader(w, r, err) {
+			return true, false
+		}
+		writeError(w, http.StatusServiceUnavailable, "failed to replicate command: "+err.Error())
+		return true, false
+	}
+	return true, true
+}
+
+// raftLeader reports whether this node is the current Raft leader. It is used to
+// decide whether the local store is authoritative enough for existence checks.
+func (s *Server) raftLeader() bool { return s.raft != nil && s.raft.IsLeader() }
 
 // ---- namespaces -------------------------------------------------------------
 
@@ -216,6 +327,71 @@ func (s *Server) handleListNamespaces(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, namespaces)
+}
+
+// POST /api/v1/namespaces creates a namespace. Admin only. Namespaces are also
+// created implicitly by replicated config/role commands.
+func (s *Server) handleCreateNamespace(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+	defer r.Body.Close()
+	var req namespaceRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+
+	if s.raft != nil {
+		cmd, err := newCommand(OpNamespaceCreate, namespacePayload{Name: req.Name})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to encode namespace command")
+			return
+		}
+		if handled, committed := s.replicate(w, r, cmd); handled {
+			if committed {
+				writeJSON(w, http.StatusCreated, map[string]string{"name": req.Name})
+			}
+			return
+		}
+	}
+
+	if err := s.store.CreateNamespace(req.Name); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create namespace")
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]string{"name": req.Name})
+}
+
+// DELETE /api/v1/namespaces/{name} removes a namespace, its configurations and
+// any role grants referencing it. Admin only.
+func (s *Server) handleDeleteNamespace(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if s.raft != nil {
+		cmd, err := newCommand(OpNamespaceDelete, namespacePayload{Name: name})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to encode namespace command")
+			return
+		}
+		if handled, committed := s.replicate(w, r, cmd); handled {
+			if committed {
+				w.WriteHeader(http.StatusNoContent)
+			}
+			return
+		}
+	}
+
+	if err := s.store.DeleteNamespace(name); errors.Is(err, ErrNotFound) {
+		writeError(w, http.StatusNotFound, "namespace not found")
+		return
+	} else if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to delete namespace")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ---- roles (admin only) -----------------------------------------------------
@@ -241,6 +417,34 @@ func (s *Server) handleCreateRole(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "name is required")
 		return
 	}
+
+	if s.raft != nil {
+		token, err := newToken()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to generate role token")
+			return
+		}
+		cmd, err := newCommand(OpRoleCreate, roleCreatePayload{
+			Name: req.Name, Description: req.Description, Token: token, Namespaces: req.Namespaces,
+		})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to encode role command")
+			return
+		}
+		if handled, committed := s.replicate(w, r, cmd); handled {
+			if !committed {
+				return
+			}
+			role, err := s.store.RoleByName(req.Name)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to load created role")
+				return
+			}
+			writeJSON(w, http.StatusCreated, role)
+			return
+		}
+	}
+
 	role, err := s.store.CreateRole(req.Name, req.Description, req.Namespaces)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create role")
@@ -266,6 +470,35 @@ func (s *Server) handleUpdateRole(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "name is required")
 		return
 	}
+
+	if s.raftLeader() {
+		if _, err := s.store.RoleByID(uint(id)); errors.Is(err, ErrNotFound) {
+			writeError(w, http.StatusNotFound, "role not found")
+			return
+		}
+	}
+	if s.raft != nil {
+		cmd, err := newCommand(OpRoleUpdate, roleUpdatePayload{
+			ID: uint(id), Name: req.Name, Description: req.Description, Namespaces: req.Namespaces,
+		})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to encode role command")
+			return
+		}
+		if handled, committed := s.replicate(w, r, cmd); handled {
+			if !committed {
+				return
+			}
+			role, err := s.store.RoleByID(uint(id))
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to load updated role")
+				return
+			}
+			writeJSON(w, http.StatusOK, role)
+			return
+		}
+	}
+
 	role, err := s.store.UpdateRole(uint(id), req.Name, req.Description, req.Namespaces)
 	if errors.Is(err, ErrNotFound) {
 		writeError(w, http.StatusNotFound, "role not found")
@@ -284,7 +517,30 @@ func (s *Server) handleDeleteRole(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid role id")
 		return
 	}
+	if s.raftLeader() {
+		if _, err := s.store.RoleByID(uint(id)); errors.Is(err, ErrNotFound) {
+			writeError(w, http.StatusNotFound, "role not found")
+			return
+		}
+	}
+	if s.raft != nil {
+		cmd, err := newCommand(OpRoleDelete, roleDeletePayload{ID: uint(id)})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to encode role command")
+			return
+		}
+		if handled, committed := s.replicate(w, r, cmd); handled {
+			if committed {
+				w.WriteHeader(http.StatusNoContent)
+			}
+			return
+		}
+	}
 	if err := s.store.DeleteRole(uint(id)); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			writeError(w, http.StatusNotFound, "role not found")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "failed to delete role")
 		return
 	}
@@ -298,6 +554,37 @@ func (s *Server) handleRotateRole(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid role id")
 		return
 	}
+	if s.raftLeader() {
+		if _, err := s.store.RoleByID(uint(id)); errors.Is(err, ErrNotFound) {
+			writeError(w, http.StatusNotFound, "role not found")
+			return
+		}
+	}
+	if s.raft != nil {
+		token, err := newToken()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to generate role token")
+			return
+		}
+		cmd, err := newCommand(OpRoleRotate, roleRotatePayload{ID: uint(id), Token: token})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to encode role command")
+			return
+		}
+		if handled, committed := s.replicate(w, r, cmd); handled {
+			if !committed {
+				return
+			}
+			role, err := s.store.RoleByID(uint(id))
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to load role")
+				return
+			}
+			writeJSON(w, http.StatusOK, role)
+			return
+		}
+	}
+
 	role, err := s.store.RotateRoleToken(uint(id))
 	if errors.Is(err, ErrNotFound) {
 		writeError(w, http.StatusNotFound, "role not found")
@@ -342,6 +629,43 @@ func (s *Server) handleRegisterNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if s.raft != nil {
+		// Registration is idempotent: an address that is already registered is
+		// returned as-is without proposing a new command.
+		if node, err := s.store.NodeByAddress(req.IP, req.Port); err == nil {
+			writeJSON(w, http.StatusOK, node)
+			return
+		} else if !errors.Is(err, ErrNotFound) {
+			writeError(w, http.StatusInternalServerError, "failed to look up node")
+			return
+		}
+		// Bring the new node up to date before adding it, so a dead address is
+		// rejected instead of being committed into the peer set. Followers skip
+		// this and let Apply redirect to the leader.
+		if s.raftLeader() && !s.raft.ProbePeer(net.JoinHostPort(req.IP, req.Port)) {
+			writeError(w, http.StatusServiceUnavailable, "node is not reachable yet; start it and retry")
+			return
+		}
+		cmd, err := newCommand(OpNodeRegister, nodeRegisterPayload{IP: req.IP, Port: req.Port})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to encode node command")
+			return
+		}
+		if handled, committed := s.replicate(w, r, cmd); handled {
+			if !committed {
+				return
+			}
+			node, err := s.store.NodeByAddress(req.IP, req.Port)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to load registered node")
+				return
+			}
+			s.syncNodes()
+			writeJSON(w, http.StatusOK, node)
+			return
+		}
+	}
+
 	node, err := s.store.RegisterNode(req.IP, req.Port)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to register node")
@@ -357,6 +681,26 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid node id")
 		return
+	}
+	if s.raftLeader() {
+		if _, err := s.store.NodeByID(uint(id)); errors.Is(err, ErrNotFound) {
+			writeError(w, http.StatusNotFound, "node not found")
+			return
+		}
+	}
+	if s.raft != nil {
+		cmd, err := newCommand(OpNodeDelete, nodeDeletePayload{ID: uint(id)})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to encode node command")
+			return
+		}
+		if handled, committed := s.replicate(w, r, cmd); handled {
+			if committed {
+				s.syncNodes()
+				w.WriteHeader(http.StatusNoContent)
+			}
+			return
+		}
 	}
 	if err := s.store.DeleteNode(uint(id)); errors.Is(err, ErrNotFound) {
 		writeError(w, http.StatusNotFound, "node not found")

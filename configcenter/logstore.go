@@ -5,7 +5,7 @@ import (
 
 	"gorm.io/gorm/clause"
 
-	"raft/raft"
+	"nexus/raft"
 )
 
 // RaftLogEntry is the SQLite representation of a Raft log entry. LogIndex is

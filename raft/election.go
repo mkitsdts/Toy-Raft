@@ -7,7 +7,9 @@ import (
 	"net/http"
 )
 
-// 开始选举
+// StartElection transitions this node to candidate and requests votes from all
+// peers. A candidate that wins a majority of the cluster (including itself)
+// becomes leader.
 func (rn *RaftNode) StartElection() {
 	fmt.Println("准备选举...")
 
@@ -16,192 +18,131 @@ func (rn *RaftNode) StartElection() {
 		rn.mux.Unlock()
 		return
 	}
-	rn.VoteCount = 1
+	rn.VoteCount = 1 // vote for ourselves
 	rn.LeaderIP = ""
-	rn.VotedFor = ""
+	rn.VotedFor = rn.LocalIP
 	rn.Term++
+	term := rn.Term
+	lastIndex, lastTerm := rn.lastLogIndexTermLocked()
 	rn.mux.Unlock()
 
+	peers := rn.peerList()
+	if len(peers) == 0 {
+		rn.mux.Lock()
+		rn.becomeLeaderLocked()
+		rn.mux.Unlock()
+		rn.notify()
+		return
+	}
+
+	need := (len(peers)+1)/2 + 1
 	fmt.Println("正在向其他节点发送选举请求...")
 
-	peers := rn.peerList()
 	for _, node := range peers {
-		// 发送选举请求
 		go func(targetNode string) {
-			// 生成选举请求
-			var prevLogIndex int
-			var prevLogTerm int
-			// 检测数组越界
-			if len(rn.Log) == 0 {
-				prevLogIndex = 0
-				prevLogTerm = 0
-			} else {
-				prevLogIndex = len(rn.Log) - 1
-				prevLogTerm = rn.Log[len(rn.Log)-1].Term
-			}
-
 			reqInfo := ElectionReq{
-				Term:         rn.Term,
+				Term:         term,
 				CandidateIP:  rn.LocalIP,
-				LastLogIndex: prevLogIndex,
-				LastLogTerm:  prevLogTerm,
+				LastLogIndex: lastIndex,
+				LastLogTerm:  lastTerm,
 			}
 			reqBody, _ := json.Marshal(reqInfo)
-			req, err := http.NewRequest("POST", peerURL(node, "/election"), bytes.NewBuffer(reqBody))
-			fmt.Println("正在向 " + peerURL(node, "/election") + " 发送选举请求")
+			req, err := http.NewRequest("POST", peerURL(targetNode, "/election"), bytes.NewBuffer(reqBody))
 			if err != nil {
 				return
 			}
 			req.Header.Set("Content-Type", "application/json")
 
-			httpClient := &http.Client{
-				Timeout: CONNECT_MAX_TIME,
-			}
-			fmt.Println("正在向 IP: ", node, "发送选举请求...")
-
-			// 发送选举请求
-			resp, err := httpClient.Do(req)
+			client := &http.Client{Timeout: CONNECT_MAX_TIME}
+			resp, err := client.Do(req)
 			if err != nil {
 				return
 			}
 			defer resp.Body.Close()
 
 			var electionResp ElectionResp
-			decoder := json.NewDecoder(resp.Body)
-			err = decoder.Decode(&electionResp)
-			if err != nil {
+			if err := json.NewDecoder(resp.Body).Decode(&electionResp); err != nil {
 				return
 			}
-			fmt.Println("收到 IP: ", node, "的选举")
-			// 处理选举结果
+
 			rn.mux.Lock()
-			fmt.Println("当前节点 IP: ", rn.LocalIP, "当前票数：", rn.VoteCount)
+			defer rn.mux.Unlock()
+			// Ignore replies from an election we already lost or an older term.
+			if rn.state != CANDIDATE || rn.Term != term {
+				return
+			}
 			if electionResp.Term > rn.Term {
-				fmt.Println("选举失败，当前任期：", rn.Term, "请求任期：", electionResp.Term)
 				rn.Term = electionResp.Term
 				rn.state = FOLLOWER
 				rn.VoteCount = 0
-				select {
-				case rn.stateChan <- struct{}{}:
-					fmt.Println("状态变化通知成功")
-				default:
-					fmt.Println("状态变化通知失败")
-				}
-				rn.mux.Unlock()
+				rn.LeaderIP = ""
+				rn.VotedFor = ""
+				rn.notify()
 				return
-			} else if electionResp.VoteGranted {
-				fmt.Println("收到投票， IP: ", node)
-				rn.VoteCount++
-				if rn.VoteCount > uint16((len(peers)+1)/2) {
-					fmt.Println("选举成功，当前任期：", rn.Term, "请求任期：", electionResp.Term, "当选 IP: ", rn.LocalIP)
-					rn.VoteCount = 0
-					rn.state = LEADER
-					rn.LeaderIP = rn.LocalIP
-					select {
-					case rn.stateChan <- struct{}{}:
-						fmt.Println("状态变化通知成功")
-					default:
-						fmt.Println("状态变化通知失败")
-					}
-					rn.mux.Unlock()
-				} else {
-					fmt.Println("未获得 IP: ", node, " 选票，当前票数：", rn.VoteCount)
-					rn.mux.Unlock()
-					return
-				}
-			} else {
-				fmt.Println("未获得 IP: ", node, " 选票，当前票数：", rn.VoteCount)
-				rn.mux.Unlock()
+			}
+			if !electionResp.VoteGranted {
+				fmt.Println("未获得 IP: ", targetNode, " 选票")
+				return
+			}
+			rn.VoteCount++
+			fmt.Println("收到投票，IP:", targetNode, "当前票数：", rn.VoteCount, "需要：", need)
+			if int(rn.VoteCount) >= need {
+				fmt.Println("选举成功，当前任期：", rn.Term, "当选 IP: ", rn.LocalIP)
+				rn.becomeLeaderLocked()
+				rn.notify()
 			}
 		}(node)
 	}
 }
 
-// 处理选举请求
+// HandleElection processes a RequestVote RPC.
 func (rn *RaftNode) HandleElection(w http.ResponseWriter, r *http.Request) {
-	// 解析数据
-	var reqInfo ElectionReq
-	decoder := json.NewDecoder(r.Body)
-	err := decoder.Decode(&reqInfo)
-	if err != nil {
+	var req ElectionReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		return
 	}
-	// 处理选举
-	fmt.Println("处理选举请求...")
-	if rn.VotedFor != reqInfo.CandidateIP && rn.VotedFor != "" {
-		// 拒绝投票
-		respInfo := ElectionResp{
-			Term:        rn.Term,
-			VoteGranted: false,
-		}
-		respBody, _ := json.Marshal(respInfo)
-		w.Write(respBody)
-		fmt.Println("投票节点不一样，拒绝投票，当前任期：", rn.Term, "请求任期：", reqInfo.Term)
-		return
-	} else if rn.VotedFor == reqInfo.CandidateIP {
-		respInfo := ElectionResp{
-			Term:        rn.Term,
-			VoteGranted: true,
-		}
-		respBody, _ := json.Marshal(respInfo)
-		w.Write(respBody)
-		fmt.Println("同意投票，当前任期：", rn.Term, "请求任期：", reqInfo.Term)
-		return
+	resp := rn.handleVote(req)
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// handleVote applies the Raft voting rules and returns the response.
+func (rn *RaftNode) handleVote(req ElectionReq) ElectionResp {
+	rn.mux.Lock()
+	defer rn.mux.Unlock()
+
+	// 1. Reject stale terms.
+	if req.Term < rn.Term {
+		fmt.Println("任期不同，拒绝投票，当前任期：", rn.Term, "请求任期：", req.Term)
+		return ElectionResp{Term: rn.Term, VoteGranted: false}
 	}
 
-	if reqInfo.Term < rn.Term {
-		// 拒绝投票
-		respInfo := ElectionResp{
-			Term:        rn.Term,
-			VoteGranted: false,
-		}
-		respBody, _ := json.Marshal(respInfo)
-		w.Write(respBody)
-		fmt.Println("任期不同，拒绝投票，当前任期：", rn.Term, "请求任期：", reqInfo.Term)
-		return
-	} else if reqInfo.Term > rn.Term {
-		// 更新自身状态
-		rn.Term = reqInfo.Term
+	// 2. A newer term means we step down and clear our vote.
+	if req.Term > rn.Term {
+		rn.Term = req.Term
 		rn.state = FOLLOWER
 		rn.LeaderIP = ""
-		rn.VotedFor = reqInfo.CandidateIP
+		rn.VotedFor = ""
 		rn.VoteCount = 0
-		// 返回投票
-		respInfo := ElectionResp{
-			Term:        rn.Term,
-			VoteGranted: true,
-		}
-		respBody, _ := json.Marshal(respInfo)
-		w.Write(respBody)
-		fmt.Println("投票成功，当前任期：", rn.Term, "请求任期：", reqInfo.Term)
-		return
-	} else {
-		if rn.state == CANDIDATE {
-			if len(rn.Log)-1 > reqInfo.LastLogIndex {
-				// 拒绝投票
-				respInfo := ElectionResp{
-					Term:        rn.Term,
-					VoteGranted: false,
-				}
-				respBody, _ := json.Marshal(respInfo)
-				w.Write(respBody)
-				fmt.Println("日志不够新，拒绝投票，当前任期：", rn.Term, "请求任期：", reqInfo.Term)
-				return
-			} else {
-				// 投票
-				respInfo := ElectionResp{
-					Term:        rn.Term,
-					VoteGranted: true,
-				}
-				rn.Term = reqInfo.Term
-				rn.state = FOLLOWER
-				rn.VotedFor = reqInfo.CandidateIP
-				respBody, _ := json.Marshal(respInfo)
-				w.Write(respBody)
-				rn.LeaderIP = reqInfo.CandidateIP
-				fmt.Println("投票成功，当前任期：", rn.Term, "请求任期：", reqInfo.Term)
-				return
-			}
-		}
 	}
+
+	// 3. One vote per term.
+	if rn.VotedFor != "" && rn.VotedFor != req.CandidateIP {
+		fmt.Println("本轮已投票给", rn.VotedFor, "，拒绝投票")
+		return ElectionResp{Term: rn.Term, VoteGranted: false}
+	}
+
+	// 4. The candidate's log must be at least as up to date as ours.
+	lastIndex, lastTerm := rn.lastLogIndexTermLocked()
+	upToDate := req.LastLogTerm > lastTerm ||
+		(req.LastLogTerm == lastTerm && req.LastLogIndex >= lastIndex)
+	if !upToDate {
+		fmt.Println("日志不够新，拒绝投票，本地：", lastIndex, lastTerm, "候选：", req.LastLogIndex, req.LastLogTerm)
+		return ElectionResp{Term: rn.Term, VoteGranted: false}
+	}
+
+	rn.VotedFor = req.CandidateIP
+	rn.LeaderIP = ""
+	fmt.Println("投票成功，候选节点：", req.CandidateIP, "当前任期：", rn.Term)
+	rn.notify()
+	return ElectionResp{Term: rn.Term, VoteGranted: true}
 }

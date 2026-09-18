@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"fmt"
 	"math/rand"
 	"net"
 	"strings"
@@ -40,28 +39,4 @@ func PeerAddress(addr string) string {
 // without an explicit port.
 func peerURL(addr, path string) string {
 	return "http://" + PeerAddress(addr) + path
-}
-
-// 保存日志到数据库：只要有日志就整份写入，不关心提交/应用进度。
-// 存储层按索引 upsert，所以重复写入是幂等的。
-// 调用方需保证已持有（或无需持有）rn.mux，本函数自身不加锁。
-func PersisLog(rn *RaftNode) {
-	if rn.storage == nil {
-		fmt.Println("未配置日志存储，跳过持久化")
-		return
-	}
-	if len(rn.Log) == 0 {
-		fmt.Println("没有需要保存的日志")
-		return
-	}
-
-	entries := make([]LogEntry, len(rn.Log))
-	copy(entries, rn.Log)
-
-	fmt.Println("正在写入日志至数据库...")
-	if err := rn.storage.AppendLogEntries(0, entries); err != nil {
-		fmt.Println("写入日志失败：", err)
-		return
-	}
-	fmt.Println("写入日志成功，当前日志数量：", len(entries))
 }
