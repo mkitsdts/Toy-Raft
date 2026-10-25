@@ -16,7 +16,7 @@ import (
 // membership command is applied, so every node (not just the one that received
 // the HTTP request) tracks the cluster membership without any extra wiring in
 // the caller.
-func NewRaftNode(store *Store, localIP string, peers []string) (*raft.RaftNode, error) {
+func NewNode(store *Store, localIP string, peers []string) (*raft.RaftNode, error) {
 	var node *raft.RaftNode
 	node, err := raft.New(raft.Config{
 		LocalIP: localIP,

@@ -50,7 +50,7 @@ func main() {
 	for _, n := range nodes {
 		addresses = append(addresses, net.JoinHostPort(n.IP, n.Port))
 	}
-	node, err := configcenter.NewRaftNode(store, cfg.LocalIP, addresses)
+	node, err := configcenter.NewNode(store, cfg.LocalIP, addresses)
 	if err != nil {
 		log.Fatalf("初始化 Raft 节点失败: %v", err)
 	}

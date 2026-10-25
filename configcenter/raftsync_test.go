@@ -20,7 +20,7 @@ func newRaftServer(t *testing.T) (*Server, *Store, *httptest.Server, *raft.RaftN
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	node, err := NewRaftNode(store, "127.0.0.1", nil)
+	node, err := NewNode(store, "127.0.0.1", nil)
 	if err != nil {
 		t.Fatalf("new raft node: %v", err)
 	}
