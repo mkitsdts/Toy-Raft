@@ -95,6 +95,17 @@ func (s *Store) LoadOrInitializeRuntimeConfig() (RuntimeConfig, error) {
 	}, nil
 }
 
+// SetLocalIP persists this node's effective address (host:port). It is called
+// at startup with the value supplied on the command line so the stored system
+// settings reflect the address actually used for Raft.
+func (s *Store) SetLocalIP(localIP string) error {
+	err := s.db.Model(&SystemSetting{ID: 1}).Update("local_ip", localIP).Error
+	if err != nil {
+		return fmt.Errorf("persist local IP: %w", err)
+	}
+	return nil
+}
+
 func splitNodeIPs(value string) []string {
 	if strings.TrimSpace(value) == "" {
 		return []string{}
