@@ -79,30 +79,60 @@ func NewServer(store *Store, token string) *Server {
 func (s *Server) SetRaft(r RaftApplier) { s.raft = r }
 
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
-	// API
-	mux.Handle("GET /api/v1/whoami", s.auth(http.HandlerFunc(s.handleWhoami)))
-	mux.Handle("GET /api/v1/configs", s.auth(http.HandlerFunc(s.handleListConfigs)))
-	mux.Handle("POST /api/v1/configs", s.auth(s.requireAdmin(http.HandlerFunc(s.handleCreateConfig))))
-	mux.Handle("GET /api/v1/configs/{namespace}/{key}", s.auth(http.HandlerFunc(s.handleGetConfig)))
-	mux.Handle("DELETE /api/v1/configs/{namespace}/{key}", s.auth(s.requireAdmin(http.HandlerFunc(s.handleDeleteConfig))))
-	mux.Handle("GET /api/v1/namespaces", s.auth(http.HandlerFunc(s.handleListNamespaces)))
-	mux.Handle("POST /api/v1/namespaces", s.auth(s.requireAdmin(http.HandlerFunc(s.handleCreateNamespace))))
-	mux.Handle("DELETE /api/v1/namespaces/{name}", s.auth(s.requireAdmin(http.HandlerFunc(s.handleDeleteNamespace))))
-	mux.Handle("GET /api/v1/roles", s.auth(s.requireAdmin(http.HandlerFunc(s.handleListRoles))))
-	mux.Handle("POST /api/v1/roles", s.auth(s.requireAdmin(http.HandlerFunc(s.handleCreateRole))))
-	mux.Handle("PUT /api/v1/roles/{id}", s.auth(s.requireAdmin(http.HandlerFunc(s.handleUpdateRole))))
-	mux.Handle("DELETE /api/v1/roles/{id}", s.auth(s.requireAdmin(http.HandlerFunc(s.handleDeleteRole))))
-	mux.Handle("POST /api/v1/roles/{id}/rotate", s.auth(s.requireAdmin(http.HandlerFunc(s.handleRotateRole))))
-	mux.Handle("GET /api/v1/nodes", s.auth(s.requireAdmin(http.HandlerFunc(s.handleListNodes))))
-	mux.Handle("POST /api/v1/nodes", s.auth(s.requireAdmin(http.HandlerFunc(s.handleRegisterNode))))
-	mux.Handle("DELETE /api/v1/nodes/{id}", s.auth(s.requireAdmin(http.HandlerFunc(s.handleDeleteNode))))
+	// API. 挂到独立的子 mux 上，再统一套一层 CORS：Web 界面可能由某个节点
+	// 提供，而写请求必须发给 leader（不同端口就是不同源）。
+	api := http.NewServeMux()
+	api.Handle("GET /api/v1/whoami", s.auth(http.HandlerFunc(s.handleWhoami)))
+	api.Handle("GET /api/v1/leader", s.auth(http.HandlerFunc(s.handleLeader)))
+	api.Handle("GET /api/v1/configs", s.auth(http.HandlerFunc(s.handleListConfigs)))
+	api.Handle("POST /api/v1/configs", s.auth(s.requireAdmin(http.HandlerFunc(s.handleCreateConfig))))
+	api.Handle("GET /api/v1/configs/{namespace}/{key}", s.auth(http.HandlerFunc(s.handleGetConfig)))
+	api.Handle("DELETE /api/v1/configs/{namespace}/{key}", s.auth(s.requireAdmin(http.HandlerFunc(s.handleDeleteConfig))))
+	api.Handle("GET /api/v1/namespaces", s.auth(http.HandlerFunc(s.handleListNamespaces)))
+	api.Handle("POST /api/v1/namespaces", s.auth(s.requireAdmin(http.HandlerFunc(s.handleCreateNamespace))))
+	api.Handle("DELETE /api/v1/namespaces/{name}", s.auth(s.requireAdmin(http.HandlerFunc(s.handleDeleteNamespace))))
+	api.Handle("GET /api/v1/roles", s.auth(s.requireAdmin(http.HandlerFunc(s.handleListRoles))))
+	api.Handle("POST /api/v1/roles", s.auth(s.requireAdmin(http.HandlerFunc(s.handleCreateRole))))
+	api.Handle("PUT /api/v1/roles/{id}", s.auth(s.requireAdmin(http.HandlerFunc(s.handleUpdateRole))))
+	api.Handle("DELETE /api/v1/roles/{id}", s.auth(s.requireAdmin(http.HandlerFunc(s.handleDeleteRole))))
+	api.Handle("POST /api/v1/roles/{id}/rotate", s.auth(s.requireAdmin(http.HandlerFunc(s.handleRotateRole))))
+	api.Handle("GET /api/v1/nodes", s.auth(s.requireAdmin(http.HandlerFunc(s.handleListNodes))))
+	api.Handle("POST /api/v1/nodes", s.auth(s.requireAdmin(http.HandlerFunc(s.handleRegisterNode))))
+	api.Handle("DELETE /api/v1/nodes/{id}", s.auth(s.requireAdmin(http.HandlerFunc(s.handleDeleteNode))))
+
+	mux.Handle("/api/", cors(api))
 
 	// Frontend (embedded single-page app)
 	assets, err := fs.Sub(webFS, "web")
 	if err != nil {
 		panic(err)
 	}
-	mux.Handle("GET /", http.FileServer(http.FS(assets)))
+	// 静态资源 / 前端页面。用无方法的 "/" 而不是 "GET /"，否则和
+	// "/api/" 方法集不同但路径更宽，Go 1.22 的 ServeMux 会判定为冲突。
+	mux.Handle("/", http.FileServer(http.FS(assets)))
+}
+
+// cors lets the embedded web UI, served by whatever node the browser happens to
+// open, call the API of the node that is currently the Raft leader (a different
+// port is a different origin). Preflight requests are answered before auth so
+// the browser's OPTIONS probe never needs the Auth header.
+func cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if origin := r.Header.Get("Origin"); origin != "" {
+			h := w.Header()
+			h.Set("Access-Control-Allow-Origin", origin)
+			h.Set("Vary", "Origin")
+			h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			h.Set("Access-Control-Allow-Headers", "Auth, Content-Type")
+			h.Set("Access-Control-Expose-Headers", "Location, X-Raft-Leader")
+			h.Set("Access-Control-Max-Age", "600")
+		}
+		if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // ---- whoami -----------------------------------------------------------------
@@ -122,6 +152,21 @@ func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request) {
 			"description": p.role.Description,
 		},
 		"namespaces": roleNamespaceNames(p.role),
+	})
+}
+
+// GET /api/v1/leader reports the address of the current Raft leader so a web UI
+// served by a follower can send its write requests straight to the leader
+// instead of relying on a cross-origin 307 redirect (browsers drop the custom
+// Auth header when following it).
+func (s *Server) handleLeader(w http.ResponseWriter, r *http.Request) {
+	leader := ""
+	if s.raft != nil {
+		leader = raft.PeerAddress(s.raft.Leader())
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"leader":    leader,
+		"is_leader": s.raftLeader(),
 	})
 }
 

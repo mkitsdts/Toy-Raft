@@ -4,6 +4,8 @@
 const state = {
   token: localStorage.getItem("cc_token") || "",
   isAdmin: false,
+  leader: "",
+  isLeaderNode: false,
   namespaces: [],
   currentNamespace: null,
   configs: [],
@@ -17,11 +19,35 @@ const $$ = (sel) => document.querySelectorAll(sel);
 
 /* ---------- API ---------- */
 
-async function api(path, options = {}) {
-  const resp = await fetch(path, {
-    ...options,
-    headers: { "Auth": state.token, "Content-Type": "application/json", ...(options.headers || {}) },
-  });
+// 读请求发给本节点（读的是本地状态机），写请求必须发给 leader：
+// follower 只会返回 307，而浏览器跨源跟随后会丢掉自定义的 Auth 头。
+async function api(path, options = {}, retried = false) {
+  const method = (options.method || "GET").toUpperCase();
+  let base = "";
+  if (method !== "GET") {
+    if (!state.leader) await refreshLeader().catch(() => {});
+    if (state.leader) base = `${location.protocol}//${state.leader}`;
+  }
+
+  let resp;
+  try {
+    resp = await fetch(base + path, {
+      ...options,
+      headers: { "Auth": state.token, "Content-Type": "application/json", ...(options.headers || {}) },
+    });
+  } catch (e) {
+    if (!retried) {
+      await refreshLeader().catch(() => {});
+      return api(path, options, true);
+    }
+    throw new Error(`无法连接 Leader ${state.leader || "(未选出)"}`);
+  }
+
+  // leader 可能刚切换：刷新地址后重试一次。
+  if (method !== "GET" && (resp.status === 401 || resp.status === 307) && !retried) {
+    await refreshLeader().catch(() => {});
+    return api(path, options, true);
+  }
   if (resp.status === 401) {
     logout();
     throw new Error("Token 无效或已过期");
@@ -30,6 +56,20 @@ async function api(path, options = {}) {
   const body = await resp.json().catch(() => ({}));
   if (!resp.ok) throw new Error(body.error || `请求失败 (${resp.status})`);
   return body;
+}
+
+// 查询集群当前 leader，并在右上角显示出来（演示时一眼能看出写到了哪个节点）。
+async function refreshLeader() {
+  const info = await api("/api/v1/leader");
+  state.leader = info.leader || "";
+  state.isLeaderNode = Boolean(info.is_leader);
+  const el = $("#leader-badge");
+  if (el) {
+    el.textContent = state.leader
+      ? `Leader: ${state.leader}${state.isLeaderNode ? "（本节点）" : ""}`
+      : "Leader: 未选出";
+  }
+  return state.leader;
 }
 
 /* ---------- 登录 / 退出 ---------- */
@@ -54,6 +94,7 @@ async function login(token) {
   $("#app-view").classList.remove("hidden");
   switchTab("configs");
   await loadNamespaces();
+  await refreshLeader().catch(() => {});
 }
 
 /* ---------- 命名空间 & 配置 ---------- */
@@ -61,6 +102,10 @@ async function login(token) {
 async function loadNamespaces() {
   state.namespaces = await api("/api/v1/namespaces");
   renderNamespaceList();
+  updateNamespaceDatalist();
+}
+
+function updateNamespaceDatalist() {
   const dl = $("#namespace-datalist");
   dl.innerHTML = state.namespaces.map((ns) => `<option value="${esc(ns)}">`).join("");
 }
@@ -167,7 +212,9 @@ async function saveConfig() {
     closeConfigModal();
     toast("已保存");
     await loadNamespaces();
-    if (state.namespaces.includes(namespace)) await selectNamespace(namespace);
+    // 刚提交时本节点的命名空间列表可能还没 apply 到（follower 滞后），
+    // 也先把界面切过去，轮询会把新命名空间和内容补上。
+    await selectNamespace(namespace);
   } catch (e) {
     $("#cfg-error").textContent = e.message; // 服务端 yaml/json 校验错误也会显示在这里
   }
@@ -386,6 +433,45 @@ $("#node-save").onclick = saveNode;
 $("#node-port").addEventListener("keydown", (e) => { if (e.key === "Enter") saveNode(); });
 $$(".modal-mask").forEach((m) =>
   m.addEventListener("click", (e) => { if (e.target === m) m.classList.add("hidden"); }));
+
+/* ---------- 自动刷新 ---------- */
+
+// 演示用：一个界面写入后，其他节点的界面会在 2 秒内自动出现这条数据，
+// 不需要手动刷新（弹窗打开时不打断编辑）。
+const POLL_MS = 2000;
+
+function configsSignature(list) {
+  return list.map((c) => `${c.namespace}/${c.key}@${c.version}`).join("|");
+}
+
+async function refreshView() {
+  if (!state.token || document.hidden) return;
+  if ($("#app-view").classList.contains("hidden")) return;
+  if (!$("#config-modal").classList.contains("hidden")) return;
+
+  if (!$("#tab-configs").classList.contains("hidden")) {
+    const namespaces = await api("/api/v1/namespaces");
+    if (namespaces.join("|") !== state.namespaces.join("|")) {
+      state.namespaces = namespaces;
+      renderNamespaceList();
+      updateNamespaceDatalist();
+    }
+    if (state.currentNamespace) {
+      const configs = await api(`/api/v1/configs?namespace=${encodeURIComponent(state.currentNamespace)}`);
+      if (configsSignature(configs) !== configsSignature(state.configs)) {
+        state.configs = configs;
+        renderConfigTable();
+      }
+    }
+  }
+  await refreshLeader().catch(() => {});
+}
+
+setInterval(() => { refreshView().catch(() => { /* 轮询失败保持安静 */ }); }, POLL_MS);
+// 切回到某个标签页（或窗口）时立即刷一次，不用等下一个轮询周期。
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) refreshView().catch(() => {});
+});
 
 /* ---------- 启动 ---------- */
 
